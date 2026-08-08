@@ -15,6 +15,9 @@ APP_DIR="${APP_DIR:-/opt/digi-fridge}"
 DATA_DIR="${DATA_DIR:-/var/lib/digi-fridge}"
 SERVICE_USER="${SERVICE_USER:-digifridge}"
 BRANCH="${BRANCH:-main}"
+# For private repos: clone once as your user (git will prompt for username + PAT),
+# then install with: sudo LOCAL_SRC=/tmp/digi-fridge-src bash deploy/setup.sh
+LOCAL_SRC="${LOCAL_SRC:-}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "Run this script as root (sudo)." >&2
@@ -35,19 +38,39 @@ echo "==> Creating directories"
 mkdir -p "${APP_DIR}" "${DATA_DIR}"
 chown "${SERVICE_USER}:${SERVICE_USER}" "${DATA_DIR}"
 
-if [[ -d "${APP_DIR}/.git" ]]; then
+if [[ -n "${LOCAL_SRC}" ]]; then
+  echo "==> Installing from local source: ${LOCAL_SRC}"
+  if [[ ! -d "${LOCAL_SRC}" ]]; then
+    echo "LOCAL_SRC does not exist: ${LOCAL_SRC}" >&2
+    exit 1
+  fi
+  # Preserve an existing .env across reinstalls.
+  if [[ -f "${APP_DIR}/.env" ]]; then
+    cp "${APP_DIR}/.env" /tmp/digi-fridge.env.bak
+  fi
+  rm -rf "${APP_DIR}"
+  mkdir -p "${APP_DIR}"
+  cp -a "${LOCAL_SRC}/." "${APP_DIR}/"
+  if [[ -f /tmp/digi-fridge.env.bak ]]; then
+    mv /tmp/digi-fridge.env.bak "${APP_DIR}/.env"
+  fi
+  # Drop any embedded credentials from the remote URL if present.
+  if [[ -d "${APP_DIR}/.git" ]]; then
+    git -C "${APP_DIR}" remote set-url origin "https://github.com/eleana-tan/digi-fridge.git" || true
+  fi
+  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
+elif [[ -d "${APP_DIR}/.git" ]]; then
   echo "==> Updating existing checkout"
-  # Preserve .env across updates
   sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" fetch origin
   sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" checkout "${BRANCH}"
   sudo -u "${SERVICE_USER}" git -C "${APP_DIR}" pull --ff-only origin "${BRANCH}"
 else
   echo "==> Cloning ${REPO_URL}"
-  # Clone as root into a temp location if APP_DIR is non-empty, else into APP_DIR
   if [[ -z "$(ls -A "${APP_DIR}" 2>/dev/null || true)" ]]; then
     git clone --branch "${BRANCH}" "${REPO_URL}" "${APP_DIR}"
   else
     echo "APP_DIR ${APP_DIR} is not empty and not a git repo. Aborting." >&2
+    echo "For a private repo, clone as your user then re-run with LOCAL_SRC=..." >&2
     exit 1
   fi
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"

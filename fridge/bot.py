@@ -21,7 +21,7 @@ import os
 from dataclasses import asdict
 from datetime import time as dt_time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -33,7 +33,16 @@ from telegram.ext import (
 
 from . import actions, db
 from .config import Settings, get_settings
-from .models import ACTION_ADD, ItemSpec, ParsedAction
+from .models import (
+    ACTION_ADD,
+    ACTION_QUERY,
+    QUERY_BY_USER,
+    QUERY_EXPIRING,
+    QUERY_LIST_ALL,
+    QUERY_WHO_HAS,
+    ItemSpec,
+    ParsedAction,
+)
 from .parser import build_parser
 from .pending import (
     STATUS_CANCELLED,
@@ -63,6 +72,13 @@ WELCOME = (
     '- "what do I have?"\n'
     '- "what\'s expiring soon?"\n'
     '- "do I have milk?"\n\n'
+    "Slash commands (tap / in Telegram):\n"
+    "/list — what's in the fridge\n"
+    "/expiring — what's going bad soon\n"
+    "/who milk — who bought an item\n"
+    "/by alice — what someone added\n"
+    "/cancel — discard a pending photo draft\n"
+    "/help — this message\n\n"
     "You can also:\n"
     "- send a voice message and I'll transcribe it\n"
     "- send a photo of a receipt or groceries — I'll propose items; confirm, "
@@ -72,6 +88,17 @@ WELCOME = (
     "(ordinary lists don't show buyers).\n"
     "I'll also remind you when things are about to expire."
 )
+
+# Shown in Telegram's "/" menu (registered on startup via set_my_commands).
+BOT_COMMANDS = [
+    BotCommand("start", "Welcome & how to use"),
+    BotCommand("help", "Help and tips"),
+    BotCommand("list", "Show what's in the fridge"),
+    BotCommand("expiring", "Show items expiring soon"),
+    BotCommand("who", "Who bought an item — /who milk"),
+    BotCommand("by", "What someone added — /by alice"),
+    BotCommand("cancel", "Cancel a pending photo draft"),
+]
 
 
 def resolve_user_id(update: Update) -> str:
@@ -110,6 +137,79 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(WELCOME)
+
+
+async def _run_query(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    parsed: ParsedAction,
+) -> None:
+    """Run a structured query against the current chat's fridge scope."""
+    scope_key, added_by, is_group = resolve_scope(update)
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    _remember_dm(conn, update, added_by)
+    reply = actions.execute(
+        conn, scope_key, parsed, added_by=added_by, is_group=is_group
+    )
+    await update.message.reply_text(reply)
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_query(
+        update,
+        context,
+        ParsedAction(action=ACTION_QUERY, query_type=QUERY_LIST_ALL),
+    )
+
+
+async def cmd_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_query(
+        update,
+        context,
+        ParsedAction(action=ACTION_QUERY, query_type=QUERY_EXPIRING),
+    )
+
+
+async def cmd_who(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/who milk — who bought that item."""
+    target = " ".join(context.args).strip() if context.args else ""
+    if not target:
+        await update.message.reply_text(
+            "Usage: /who <item>\nExample: /who milk"
+        )
+        return
+    await _run_query(
+        update,
+        context,
+        ParsedAction(
+            action=ACTION_QUERY, query_type=QUERY_WHO_HAS, query_target=target
+        ),
+    )
+
+
+async def cmd_by(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/by alice — what that person added."""
+    target = " ".join(context.args).strip().lstrip("@") if context.args else ""
+    if not target:
+        await update.message.reply_text(
+            "Usage: /by <username>\nExample: /by alice"
+        )
+        return
+    await _run_query(
+        update,
+        context,
+        ParsedAction(
+            action=ACTION_QUERY, query_type=QUERY_BY_USER, query_target=target
+        ),
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Discard a pending photo draft, if any."""
+    if context.user_data.pop("pending_photo_items", None) is None:
+        await update.message.reply_text("Nothing pending to cancel.")
+        return
+    await update.message.reply_text("Okay, I discarded the photo draft.")
 
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,13 +483,24 @@ async def on_photo_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
+async def _post_init(application: Application) -> None:
+    """Publish slash commands so they appear in Telegram's / menu."""
+    await application.bot.set_my_commands(BOT_COMMANDS)
+    logger.info("Registered bot commands: %s", ", ".join(c.command for c in BOT_COMMANDS))
+
+
 def build_application(settings: Settings) -> Application:
     if not settings.telegram_bot_token:
         raise SystemExit(
             "TELEGRAM_BOT_TOKEN is not set. Copy .env.example to .env and fill it in."
         )
 
-    application = Application.builder().token(settings.telegram_bot_token).build()
+    application = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .post_init(_post_init)
+        .build()
+    )
 
     echo_mode = os.environ.get("ECHO_MODE", "").strip() in {"1", "true", "yes"}
 
@@ -404,6 +515,12 @@ def build_application(settings: Settings) -> Application:
         return application
 
     # Full mode: open the DB, build the parser, wire the reminder job.
+    application.add_handler(CommandHandler("list", cmd_list))
+    application.add_handler(CommandHandler("expiring", cmd_expiring))
+    application.add_handler(CommandHandler("who", cmd_who))
+    application.add_handler(CommandHandler("by", cmd_by))
+    application.add_handler(CommandHandler("cancel", cmd_cancel))
+
     conn = db.connect(settings.db_path)
     parser = build_parser(
         openai_api_key=settings.openai_api_key,
