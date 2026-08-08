@@ -1,0 +1,7 @@
+# Telegram bot framework (job-queue extra provides the daily reminder scheduler)
+python-telegram-bot[job-queue]>=21.6,<22
+
+# OpenAI client for the LLM message-parsing layer.
+# The app also ships a dependency-free rule-based parser, so this is only
+# required if you set OPENAI_API_KEY and want real LLM parsing.
+openai>=1.40,<2
