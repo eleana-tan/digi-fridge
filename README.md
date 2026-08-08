@@ -277,6 +277,64 @@ requirements.txt
 .env.example
 ```
 
+## Deploy on a Hetzner VPS (recommended)
+
+GitHub hosts the code; the bot runs as a always-on process on your VPS via
+**systemd**. Your domain (`eleanatanrui.com`) is optional for polling — useful
+for SSH (`ssh you@eleanatanrui.com`) and later HTTPS webhooks if you want them.
+
+### One-time setup (on the VPS, as root)
+
+1. Point DNS (optional): an **A record** for `eleanatanrui.com` (or
+   `bot.eleanatanrui.com`) → your Hetzner server IPv4.
+2. SSH in: `ssh root@YOUR_VPS_IP` (or the domain once DNS propagates).
+3. If the GitHub repo is **private**, either make it public, or clone with a
+   token / deploy key. Easiest for a personal bot: temporarily set
+   `REPO_URL` with a [fine-grained PAT](https://github.com/settings/tokens)
+   that can read the repo:
+   ```bash
+   export REPO_URL='https://YOUR_GITHUB_USER:YOUR_PAT@github.com/eleana-tan/digi-fridge.git'
+   ```
+4. Run the installer:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/eleana-tan/digi-fridge/main/deploy/setup.sh | bash
+   ```
+   If the repo is private and `curl` of the raw script fails, copy `deploy/`
+   up with `scp`, then: `bash /path/to/setup.sh`.
+5. Edit secrets:
+   ```bash
+   nano /opt/digi-fridge/.env
+   ```
+   Set at least `TELEGRAM_BOT_TOKEN` and `OPENAI_API_KEY`. `DB_PATH` is already
+   set to `/var/lib/digi-fridge/fridge.db` (survives code updates).
+6. Start and watch logs:
+   ```bash
+   systemctl restart digi-fridge
+   systemctl status digi-fridge
+   journalctl -u digi-fridge -f
+   ```
+7. **Stop the bot on your laptop** (`Ctrl+C`). Only one process may poll with
+   the same token.
+
+### Updating after you push to GitHub
+
+```bash
+sudo bash /opt/digi-fridge/deploy/setup.sh
+sudo systemctl restart digi-fridge
+```
+
+### Useful commands
+
+| Command | What it does |
+| --- | --- |
+| `systemctl status digi-fridge` | Is it running? |
+| `journalctl -u digi-fridge -f` | Live logs |
+| `systemctl restart digi-fridge` | Restart after `.env` edits |
+| `systemctl stop digi-fridge` | Stop the bot |
+
+Firewall: for polling you only need **SSH** open. No need to open 80/443 unless
+you later switch to webhooks.
+
 ## Non-goals (this pass)
 
 Per-user inventories (DMs) and shared group fridges with per-item attribution
