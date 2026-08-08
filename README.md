@@ -1,7 +1,6 @@
 # Fridge / Pantry Inventory Telegram Bot
 
-<!-- Replace OWNER/REPO with your GitHub path to activate the badge. -->
-[![tests](https://github.com/OWNER/REPO/actions/workflows/tests.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/tests.yml)
+[![tests](https://github.com/eleana-tan/digi-fridge/actions/workflows/tests.yml/badge.svg)](https://github.com/eleana-tan/digi-fridge/actions/workflows/tests.yml)
 
 A Telegram bot that maintains a running inventory of what's in your fridge/pantry
 from plain-language messages ("bought milk and eggs", "used the last of the
