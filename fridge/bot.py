@@ -18,10 +18,12 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from datetime import time as dt_time
 
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -49,7 +51,11 @@ from .group_gate import (
     strip_bot_mention,
 )
 from .parser import build_parser
-from .recipes import build_recipe_suggester, format_recipe_reply
+from .recipes import (
+    build_recipe_suggester,
+    format_recipe_reply,
+    split_recipe_command_args,
+)
 from .pending import (
     STATUS_CANCELLED,
     STATUS_CONFIRMED,
@@ -163,6 +169,106 @@ def _should_process_group_message(
         text=text,
         allow_fridge_intent=allow_fridge_intent,
     )
+
+
+# Telegram clears chat-action status after ~5s; refresh sooner so it never gaps.
+_TYPING_INTERVAL_S = 2.5
+_PROGRESS_PLACEHOLDER = "\u2026"  # visible until we edit in the real reply
+
+
+class ProgressReply:
+    """Placeholder message that becomes the bot's final answer via ``send``."""
+
+    def __init__(self, message: Message | None, status: Message | None) -> None:
+        self._message = message
+        self._status = status
+
+    async def send(self, text: str, **kwargs) -> None:
+        status = self._status
+        self._status = None
+        if status is not None:
+            try:
+                await status.edit_text(text, **kwargs)
+                return
+            except Exception:  # noqa: BLE001
+                logger.debug("Could not edit progress placeholder", exc_info=True)
+                with suppress(Exception):
+                    await status.delete()
+        if self._message is not None:
+            await self._message.reply_text(text, **kwargs)
+
+    async def discard(self) -> None:
+        """Remove an unused placeholder (e.g. handler returned with no reply)."""
+        status = self._status
+        self._status = None
+        if status is not None:
+            with suppress(Exception):
+                await status.delete()
+
+
+def _chat_target(
+    update: Update,
+) -> tuple[int | None, Message | None, int | None]:
+    chat = update.effective_chat
+    message = update.effective_message
+    thread_id = getattr(message, "message_thread_id", None) if message else None
+    return (chat.id if chat else None, message, thread_id)
+
+
+@asynccontextmanager
+async def typing_while(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int | None,
+    *,
+    message: Message | None = None,
+    message_thread_id: int | None = None,
+):
+    """Keep "typing…" alive and expose a placeholder the caller edits into a reply.
+
+    Yields a :class:`ProgressReply`. Prefer ``await progress.send(text)`` for the
+    final answer so something stays visible in-chat until the reply is ready.
+    """
+    if message_thread_id is None and message is not None:
+        message_thread_id = getattr(message, "message_thread_id", None)
+
+    status: Message | None = None
+    if message is not None:
+        try:
+            status = await message.reply_text(_PROGRESS_PLACEHOLDER)
+        except Exception:  # noqa: BLE001
+            logger.debug("Could not send progress placeholder", exc_info=True)
+
+    progress = ProgressReply(message, status)
+    stop = asyncio.Event()
+
+    async def _pulse() -> None:
+        if chat_id is None:
+            return
+        while not stop.is_set():
+            try:
+                await context.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.TYPING,
+                    message_thread_id=message_thread_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep pulsing through transient errors
+                logger.warning("typing chat action failed", exc_info=True)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=_TYPING_INTERVAL_S)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(_pulse(), name="typing-pulse")
+    try:
+        yield progress
+    finally:
+        stop.set()
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        await progress.discard()
 
 
 # ---------------------------------------------------------------------------
@@ -317,32 +423,33 @@ async def _process_text(
     parser = context.application.bot_data["parser"]
 
     _remember_dm(conn, update, added_by)
-    if update.effective_chat:
-        # Immediate feedback while the (possibly slow) parse runs.
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id, action="typing"
+    chat_id, message, thread_id = _chat_target(update)
+
+    async with typing_while(
+        context, chat_id, message=message, message_thread_id=thread_id
+    ) as progress:
+        try:
+            parsed = await asyncio.to_thread(parser.parse, message_text)
+        except Exception:  # noqa: BLE001 - never crash the handler on parse errors
+            logger.exception("Parser failed for message: %r", message_text)
+            db.log_action(conn, added_by, message_text, "PARSE_ERROR")
+            await progress.send(
+                "Sorry, I had trouble understanding that. Please try rephrasing."
+            )
+            return
+
+        db.log_action(conn, added_by, message_text, json.dumps(asdict(parsed)))
+
+        if parsed.action == ACTION_QUERY and parsed.query_type == QUERY_RECIPES:
+            await _reply_recipes(
+                update, context, scope_key, parsed, progress=progress
+            )
+            return
+
+        reply = actions.execute(
+            conn, scope_key, parsed, added_by=added_by, is_group=is_group
         )
-
-    try:
-        parsed = await asyncio.to_thread(parser.parse, message_text)
-    except Exception:  # noqa: BLE001 - never crash the handler on parse errors
-        logger.exception("Parser failed for message: %r", message_text)
-        db.log_action(conn, added_by, message_text, "PARSE_ERROR")
-        await update.message.reply_text(
-            "Sorry, I had trouble understanding that. Please try rephrasing."
-        )
-        return
-
-    db.log_action(conn, added_by, message_text, json.dumps(asdict(parsed)))
-
-    if parsed.action == ACTION_QUERY and parsed.query_type == QUERY_RECIPES:
-        await _reply_recipes(update, context, scope_key, parsed)
-        return
-
-    reply = actions.execute(
-        conn, scope_key, parsed, added_by=added_by, is_group=is_group
-    )
-    await update.message.reply_text(reply)
+        await progress.send(reply)
 
 
 async def _reply_recipes(
@@ -350,15 +457,22 @@ async def _reply_recipes(
     context: ContextTypes.DEFAULT_TYPE,
     scope_key: str,
     parsed: ParsedAction,
+    *,
+    progress: ProgressReply,
 ) -> None:
-    """Suggest recipes from named ingredients or the current fridge inventory."""
+    """Suggest recipes from named ingredients or the current fridge inventory.
+
+    ``progress`` comes from the caller's ``typing_while`` so typing/placeholder
+    stay active through the slow suggestion call.
+    """
     suggester = context.application.bot_data.get("recipe_suggester")
     if suggester is None:
-        await update.message.reply_text(
+        await progress.send(
             "Recipe ideas need an OpenAI API key. Set OPENAI_API_KEY in .env."
         )
         return
 
+    request = (parsed.notes or "").strip()
     ingredients = [spec.item_name for spec in parsed.items if spec.item_name]
     if not ingredients:
         conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
@@ -373,37 +487,41 @@ async def _reply_recipes(
             seen.add(key)
             unique.append(name)
 
-    if update.effective_chat:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id, action="typing"
-        )
     try:
-        recipes = await asyncio.to_thread(suggester.suggest, unique)
+        recipes = await asyncio.to_thread(
+            suggester.suggest, unique, request=request
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Recipe suggestion failed")
-        await update.message.reply_text(
+        await progress.send(
             "Sorry, I couldn't fetch recipe ideas just now. Try again in a moment."
         )
         return
-    await update.message.reply_text(
-        format_recipe_reply(recipes, unique),
+    await progress.send(
+        format_recipe_reply(recipes, unique, request=request),
         disable_web_page_preview=True,
     )
 
 
 async def cmd_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/recipe — ideas from fridge; /recipe eggs milk — from listed ingredients."""
+    """/recipe — fridge ideas; /recipe eggs milk — ingredients; /recipe korean — style."""
     scope_key, added_by, _is_group = resolve_scope(update)
     conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
     _remember_dm(conn, update, added_by)
 
-    items = [
-        ItemSpec(item_name=arg.strip().lower())
-        for arg in (context.args or [])
-        if arg.strip()
-    ]
-    parsed = ParsedAction(action=ACTION_QUERY, query_type=QUERY_RECIPES, items=items)
-    await _reply_recipes(update, context, scope_key, parsed)
+    ingredient_names, request = split_recipe_command_args(context.args or [])
+    items = [ItemSpec(item_name=name) for name in ingredient_names]
+    parsed = ParsedAction(
+        action=ACTION_QUERY,
+        query_type=QUERY_RECIPES,
+        items=items,
+        notes=request or None,
+    )
+    chat_id, message, thread_id = _chat_target(update)
+    async with typing_while(
+        context, chat_id, message=message, message_thread_id=thread_id
+    ) as progress:
+        await _reply_recipes(update, context, scope_key, parsed, progress=progress)
 
 
 def _remember_dm(conn, update: Update, added_by: str) -> None:
@@ -453,34 +571,35 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if voice is None:
         return
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action="typing"
-    )
+    chat_id, message, thread_id = _chat_target(update)
+    async with typing_while(
+        context, chat_id, message=message, message_thread_id=thread_id
+    ) as progress:
+        try:
+            tg_file = await voice.get_file()
+            audio_bytes = bytes(await tg_file.download_as_bytearray())
+            # Telegram voice notes are Opus/OGG; keep a sensible extension for the API.
+            filename = "audio.mp3" if update.message.audio else "voice.oga"
+            transcript = await asyncio.to_thread(
+                transcriber.transcribe, audio_bytes, filename
+            )
+        except Exception:  # noqa: BLE001 - never crash the handler
+            logger.exception("Transcription failed")
+            db.log_action(conn, user_id, "<voice message>", "TRANSCRIBE_ERROR")
+            await progress.send(
+                "Sorry, I couldn't transcribe that audio. Please try again or type it."
+            )
+            return
 
-    try:
-        tg_file = await voice.get_file()
-        audio_bytes = bytes(await tg_file.download_as_bytearray())
-        # Telegram voice notes are Opus/OGG; keep a sensible extension for the API.
-        filename = "audio.mp3" if update.message.audio else "voice.oga"
-        transcript = await asyncio.to_thread(
-            transcriber.transcribe, audio_bytes, filename
-        )
-    except Exception:  # noqa: BLE001 - never crash the handler
-        logger.exception("Transcription failed")
-        db.log_action(conn, user_id, "<voice message>", "TRANSCRIBE_ERROR")
-        await update.message.reply_text(
-            "Sorry, I couldn't transcribe that audio. Please try again or type it."
-        )
-        return
+        if not transcript:
+            await progress.send(
+                "I couldn't hear anything in that recording. Mind trying again?"
+            )
+            return
 
-    if not transcript:
-        await update.message.reply_text(
-            "I couldn't hear anything in that recording. Mind trying again?"
-        )
-        return
+        # Echo what we heard so misheard audio is easy to spot, then process it.
+        await progress.send(f'I heard: "{transcript}"')
 
-    # Echo what we heard so misheard audio is easy to spot, then process it.
-    await update.message.reply_text(f'I heard: "{transcript}"')
     await _process_text(update, context, transcript)
 
 
@@ -616,38 +735,40 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id, action="typing"
-    )
-    try:
-        image_bytes = await _download_image_bytes(update.message)
-        if not image_bytes:
+    chat_id, message, thread_id = _chat_target(update)
+    async with typing_while(
+        context, chat_id, message=message, message_thread_id=thread_id
+    ) as progress:
+        try:
+            image_bytes = await _download_image_bytes(update.message)
+            if not image_bytes:
+                await progress.discard()
+                return
+            mime = _image_mime_from_message(update.message)
+            items = await asyncio.to_thread(extractor.extract, image_bytes, mime)
+        except Exception:  # noqa: BLE001 - never crash the handler
+            logger.exception("Image extraction failed")
+            db.log_action(conn, added_by, "<photo>", "VISION_ERROR")
+            await progress.send(
+                "Sorry, I couldn't read that image. Try a clearer photo or add by text."
+            )
             return
-        mime = _image_mime_from_message(update.message)
-        items = await asyncio.to_thread(extractor.extract, image_bytes, mime)
-    except Exception:  # noqa: BLE001 - never crash the handler
-        logger.exception("Image extraction failed")
-        db.log_action(conn, added_by, "<photo>", "VISION_ERROR")
-        await update.message.reply_text(
-            "Sorry, I couldn't read that image. Try a clearer photo or add by text."
+
+        if not items:
+            await progress.send(
+                "I couldn't spot any grocery items in that photo. "
+                "Try a clearer shot, or just type what you bought."
+            )
+            return
+
+        # Stash the proposed items for this user until they confirm/cancel/edit.
+        context.user_data["pending_photo_items"] = items
+        db.log_action(conn, added_by, "<photo>", f"VISION_PROPOSED:{len(items)}")
+
+        await progress.send(
+            _photo_proposal_text(items),
+            reply_markup=_photo_keyboard(),
         )
-        return
-
-    if not items:
-        await update.message.reply_text(
-            "I couldn't spot any grocery items in that photo. "
-            "Try a clearer shot, or just type what you bought."
-        )
-        return
-
-    # Stash the proposed items for this user until they confirm/cancel/edit.
-    context.user_data["pending_photo_items"] = items
-    db.log_action(conn, added_by, "<photo>", f"VISION_PROPOSED:{len(items)}")
-
-    await update.message.reply_text(
-        _photo_proposal_text(items),
-        reply_markup=_photo_keyboard(),
-    )
 
 
 async def on_photo_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -9,6 +9,7 @@ from fridge.recipes import (
     format_recipe_reply,
     recipes_from_dict,
     search_url_for,
+    split_recipe_command_args,
 )
 
 
@@ -55,6 +56,49 @@ class RecipesFromDictTests(unittest.TestCase):
             }
         )
         self.assertIsNone(ideas[0].calories_per_portion)
+
+    def test_accepts_alternate_nutrition_keys(self):
+        ideas = recipes_from_dict(
+            {
+                "recipes": [
+                    {
+                        "title": "Bibimbap",
+                        "summary": "Rice bowl.",
+                        "uses": ["rice"],
+                        "calories": 650,
+                        "protein": 22,
+                        "carbs": 90,
+                        "fat": 18,
+                        "search_query": "bibimbap recipe",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(ideas[0].calories_per_portion, 650)
+        self.assertEqual(ideas[0].protein_g, 22)
+        self.assertEqual(ideas[0].carbs_g, 90)
+        self.assertEqual(ideas[0].fat_g, 18)
+
+    def test_accepts_nested_nutrition_object(self):
+        ideas = recipes_from_dict(
+            {
+                "recipes": [
+                    {
+                        "title": "Soup",
+                        "summary": "Warm.",
+                        "uses": ["onion"],
+                        "nutrition": {
+                            "kcal": 300,
+                            "protein_g": 10,
+                            "carbs_g": 40,
+                            "fat_g": 8,
+                        },
+                    }
+                ]
+            }
+        )
+        self.assertEqual(ideas[0].calories_per_portion, 300)
+        self.assertEqual(ideas[0].protein_g, 10)
 
     def test_keeps_plausible_direct_url(self):
         ideas = recipes_from_dict(
@@ -134,6 +178,26 @@ class SearchUrlTests(unittest.TestCase):
         url = search_url_for("chicken stir fry recipe")
         self.assertIn("chicken", url)
         self.assertNotIn(" ", url)
+
+
+class SplitRecipeArgsTests(unittest.TestCase):
+    def test_ingredient_list(self):
+        self.assertEqual(
+            split_recipe_command_args(["eggs", "milk"]),
+            (["eggs", "milk"], ""),
+        )
+
+    def test_korean_recipe_is_style_request(self):
+        self.assertEqual(
+            split_recipe_command_args(["korean", "recipe"]),
+            ([], "korean recipe"),
+        )
+
+    def test_bare_cuisine(self):
+        self.assertEqual(split_recipe_command_args(["vegan"]), ([], "vegan"))
+
+    def test_empty(self):
+        self.assertEqual(split_recipe_command_args([]), ([], ""))
 
 
 class _StubMessage:
