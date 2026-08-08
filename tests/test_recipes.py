@@ -22,6 +22,7 @@ class RecipesFromDictTests(unittest.TestCase):
                         "summary": "Quick weeknight dinner.",
                         "uses": ["eggs", "spinach"],
                         "missing": ["soy sauce"],
+                        "calories_per_portion": 420,
                         "search_query": "easy veggie stir fry",
                         "url": None,
                     }
@@ -30,8 +31,24 @@ class RecipesFromDictTests(unittest.TestCase):
         )
         self.assertEqual(len(ideas), 1)
         self.assertEqual(ideas[0].title, "Veggie Stir Fry")
+        self.assertEqual(ideas[0].calories_per_portion, 420)
         self.assertIn("google.com/search", ideas[0].url)
         self.assertIn("stir", ideas[0].url.lower())
+
+    def test_calories_out_of_range_dropped(self):
+        ideas = recipes_from_dict(
+            {
+                "recipes": [
+                    {
+                        "title": "Snack",
+                        "summary": "Tiny.",
+                        "uses": ["apple"],
+                        "calories_per_portion": 10,
+                    }
+                ]
+            }
+        )
+        self.assertIsNone(ideas[0].calories_per_portion)
 
     def test_keeps_plausible_direct_url(self):
         ideas = recipes_from_dict(
@@ -81,6 +98,7 @@ class FormatReplyTests(unittest.TestCase):
                         "summary": "Simple.",
                         "uses": ["pasta", "cheese"],
                         "missing": ["garlic"],
+                        "calories_per_portion": 550,
                         "search_query": "simple cheese pasta",
                     }
                 ]
@@ -89,8 +107,10 @@ class FormatReplyTests(unittest.TestCase):
         text = format_recipe_reply(ideas, ["pasta", "cheese"])
         self.assertIn("Based on: pasta, cheese", text)
         self.assertIn("Pasta", text)
+        self.assertIn("~550 kcal per portion", text)
         self.assertIn("Recipe: http", text)
         self.assertIn("garlic", text)
+        self.assertIn("rough estimates", text)
 
     def test_empty_ingredients_message(self):
         text = format_recipe_reply([], [])
