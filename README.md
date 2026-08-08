@@ -20,6 +20,7 @@ parsing/logic without a live Telegram connection.
 | `fridge/models.py` | Shared dataclasses | no | no |
 | `fridge/db.py` | SQLite storage, migrations, CRUD, action log | no | no |
 | `fridge/parser.py` | Message → structured action (LLM **or** rule-based) | no | only LLM path |
+| `fridge/transcribe.py` | Voice audio → text (OpenAI) | no | only voice path |
 | `fridge/actions.py` | Execute action against DB, build reply | no | no |
 | `fridge/reminders.py` | Find expiring items + notify | delivery only | no |
 | `fridge/bot.py` | Telegram wiring / entrypoint | **yes** | yes |
@@ -31,6 +32,42 @@ The parser has two implementations behind one interface:
   pass a stub returning canned JSON (no network).
 - **`RuleBasedParser`** — dependency-free heuristics. Used automatically when
   `OPENAI_API_KEY` is not set, so the app runs and is testable fully offline.
+
+### Multiple users
+
+Every item, query, and reminder is keyed by a per-message `user_id` (the
+Telegram username, or a stable `chat:<id>` fallback), so each user gets their
+own isolated inventory automatically — no shared state between users. The
+blocking LLM/transcription calls run in worker threads (`asyncio.to_thread`), so
+one user's slow request never stalls the bot for everyone else; database access
+stays on the event-loop thread, keeping SQLite access single-threaded and safe.
+
+### Voice messages
+
+Send the bot a voice note and it transcribes it with OpenAI (Whisper by
+default), echoes what it heard, then runs the transcript through the exact same
+parse → DB → reply pipeline as typed text. Telegram voice notes are Opus/OGG,
+which the transcription API accepts directly (no ffmpeg needed). Voice requires
+`OPENAI_API_KEY`; without it, the bot politely asks you to type instead.
+
+### Latency
+
+Almost all response time is the OpenAI network/inference call (SQLite is
+local and negligible). Levers, cheapest first:
+
+- **Typing indicator** — the bot shows "typing…" immediately, so replies feel
+  faster even when the model is thinking.
+- **Non-blocking** — LLM/transcription calls run in worker threads, so users
+  don't queue behind each other.
+- **`PARSER_MODE=hybrid`** — the biggest win: simple messages ("bought milk",
+  "what do I have?") are answered instantly by the offline rule-based parser,
+  and only complex/date-bearing messages ("milk that expires Friday",
+  corrections) go to the LLM.
+- **Model choice** — `gpt-4o-mini` is fast and non-reasoning. If you use a
+  GPT-5-family model, set `OPENAI_REASONING_EFFORT=minimal` (or `low`) to avoid
+  slow hidden-reasoning tokens. `OPENAI_MAX_TOKENS` caps generation.
+- **Faster transcription** — `OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe`
+  is generally quicker/cheaper than `whisper-1`.
 
 ## Setup
 
@@ -47,6 +84,14 @@ cp .env.example .env   # then edit .env
 - `OPENAI_API_KEY` — optional. If set, real LLM parsing is used; otherwise the
   built-in rule-based parser is used.
 - `OPENAI_MODEL` — defaults to `gpt-4o-mini`.
+- `OPENAI_TEMPERATURE` — optional; leave blank to use the model default
+  (required for GPT-5-family models, which reject a custom temperature).
+- `PARSER_MODE` — `llm` (default), `hybrid` (rule-based fast path + LLM
+  fallback, lower latency), or `rule` (offline only). See Latency below.
+- `OPENAI_REASONING_EFFORT` — for GPT-5-family models, `minimal`/`low` cuts
+  latency sharply. Leave blank for non-reasoning models.
+- `OPENAI_MAX_TOKENS` — optional cap on the parser's output tokens.
+- `OPENAI_TRANSCRIBE_MODEL` — voice transcription model, defaults to `whisper-1`.
 - `DB_PATH` — SQLite file, defaults to `fridge.db`.
 - `EXPIRY_REMINDER_DAYS` — reminder window, defaults to `2`.
 - `REMINDER_TIME` — daily reminder time `HH:MM` in the server's local timezone,
@@ -173,6 +218,7 @@ fridge/
   models.py        dataclasses (ItemSpec, ParsedAction, InventoryItem)
   db.py            SQLite storage, migrations, CRUD, action log
   parser.py        LLMParser (injectable client) + RuleBasedParser
+  transcribe.py    OpenAITranscriber (voice -> text)
   actions.py       execute ParsedAction -> reply text
   reminders.py     build_reminders (pure) + send_daily_reminders (Telegram)
   bot.py           Telegram handlers + entrypoint
@@ -185,5 +231,6 @@ requirements.txt
 
 ## Non-goals (this pass)
 
-No shared/multi-user households, no recipe suggestions, no photo/receipt
-scanning, no auth beyond the Telegram chat id.
+Per-user inventories are supported (each Telegram user has their own fridge),
+but there are no *shared* households/fridges yet. No recipe suggestions and no
+photo/receipt scanning yet. No auth beyond the Telegram user/chat id.

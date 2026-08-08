@@ -208,22 +208,46 @@ Rules:
 class LLMParser:
     """Parse messages with an OpenAI-compatible chat completion client."""
 
-    def __init__(self, client: Any, model: str = "gpt-4o-mini") -> None:
+    def __init__(
+        self,
+        client: Any,
+        model: str = "gpt-4o-mini",
+        temperature: Optional[float] = None,
+        reasoning_effort: Optional[str] = None,
+        max_completion_tokens: Optional[int] = None,
+    ) -> None:
         self._client = client
         self._model = model
+        # temperature is only sent when explicitly set. Newer models (e.g. the
+        # GPT-5 family) reject any non-default temperature, so omitting it keeps
+        # the parser compatible across models. JSON mode + a strict prompt
+        # already make the output effectively deterministic.
+        self._temperature = temperature
+        # Latency levers, only sent when set:
+        # - reasoning_effort="minimal"/"low" slashes latency on reasoning models
+        #   (GPT-5 family) by curbing hidden reasoning tokens.
+        # - max_completion_tokens caps generation; our JSON output is small.
+        self._reasoning_effort = reasoning_effort or None
+        self._max_completion_tokens = max_completion_tokens
 
     def parse(self, message: str) -> ParsedAction:
         today = datetime.now(timezone.utc).date().isoformat()
         user_prompt = f"TODAY is {today}.\nMessage: {message}"
-        response = self._client.chat.completions.create(
+        create_kwargs: dict[str, Any] = dict(
             model=self._model,
-            temperature=0,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
         )
+        if self._temperature is not None:
+            create_kwargs["temperature"] = self._temperature
+        if self._reasoning_effort:
+            create_kwargs["reasoning_effort"] = self._reasoning_effort
+        if self._max_completion_tokens:
+            create_kwargs["max_completion_tokens"] = self._max_completion_tokens
+        response = self._client.chat.completions.create(**create_kwargs)
         content = response.choices[0].message.content or "{}"
         try:
             data = json.loads(content)
@@ -385,21 +409,93 @@ class RuleBasedParser:
 
 
 # ---------------------------------------------------------------------------
+# Hybrid parser (latency optimisation)
+# ---------------------------------------------------------------------------
+# Messages that need real understanding (dates, corrections, nuance) should
+# always go to the LLM. Simple "bought X", "used X", "what do I have" messages
+# can be answered instantly by the rule-based parser.
+_LLM_ONLY_HINTS = re.compile(
+    r"\b(expir\w*|expire|expiry|best before|use by|by\b|tomorrow|today|tonight|"
+    r"yesterday|next|last\s+week|this\s+week|week|month|day|days|"
+    r"mon|tue|wed|thu|fri|sat|sun|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
+    r"update|change|correct|set|instead|actually|move|replace)\b",
+    re.IGNORECASE,
+)
+
+
+class HybridParser:
+    """Answer simple messages with the fast rule-based parser, defer the rest.
+
+    Falls back to the (slower, smarter) LLM parser when the message looks like
+    it needs real understanding, or when the fast parser isn't confident.
+    """
+
+    def __init__(self, fast: Parser, slow: Parser) -> None:
+        self._fast = fast
+        self._slow = slow
+
+    def parse(self, message: str) -> ParsedAction:
+        if not _LLM_ONLY_HINTS.search(message or ""):
+            result = self._fast.parse(message)
+            if self._is_confident(result):
+                return result
+        return self._slow.parse(message)
+
+    @staticmethod
+    def _is_confident(result: ParsedAction) -> bool:
+        # A clear query with a known sub-type is trustworthy.
+        if result.action == ACTION_QUERY and result.query_type is not None:
+            return True
+        # Adds/removes are trustworthy only when an explicit verb matched and
+        # items were found. The rule parser's "no verb, defaulted to add"
+        # fallback is NOT trusted (could be chit-chat) -> defer to the LLM.
+        if result.action in (ACTION_ADD, ACTION_REMOVE) and result.items:
+            note = result.notes or ""
+            if "defaulted to add" not in note:
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 def build_parser(
     openai_api_key: str = "",
     model: str = "gpt-4o-mini",
+    temperature: Optional[float] = None,
+    mode: str = "llm",
+    reasoning_effort: Optional[str] = None,
+    max_completion_tokens: Optional[int] = None,
 ) -> Parser:
-    """Return an :class:`LLMParser` when an API key is present, else rule-based."""
-    if openai_api_key:
-        try:
-            from openai import OpenAI  # imported lazily so it's optional
-        except ImportError as exc:  # pragma: no cover - defensive
-            raise RuntimeError(
-                "OPENAI_API_KEY is set but the 'openai' package is not installed. "
-                "Run: pip install -r requirements.txt"
-            ) from exc
-        client = OpenAI(api_key=openai_api_key)
-        return LLMParser(client=client, model=model)
-    return RuleBasedParser()
+    """Build a parser.
+
+    ``mode`` selects the strategy:
+    - ``"llm"``    : always use the LLM (default; most accurate).
+    - ``"hybrid"`` : rule-based fast path for simple messages, LLM otherwise
+                     (much lower latency for common phrasing).
+    - ``"rule"``   : offline rule-based only (fastest, no API, less accurate).
+
+    When no API key is available, the rule-based parser is always returned.
+    """
+    if mode == "rule" or not openai_api_key:
+        return RuleBasedParser()
+
+    try:
+        from openai import OpenAI  # imported lazily so it's optional
+    except ImportError as exc:  # pragma: no cover - defensive
+        raise RuntimeError(
+            "OPENAI_API_KEY is set but the 'openai' package is not installed. "
+            "Run: pip install -r requirements.txt"
+        ) from exc
+    client = OpenAI(api_key=openai_api_key)
+    llm = LLMParser(
+        client=client,
+        model=model,
+        temperature=temperature,
+        reasoning_effort=reasoning_effort,
+        max_completion_tokens=max_completion_tokens,
+    )
+    if mode == "hybrid":
+        return HybridParser(fast=RuleBasedParser(), slow=llm)
+    return llm

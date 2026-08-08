@@ -45,6 +45,26 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_optional_float(name: str) -> "float | None":
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _get_optional_int(name: str) -> "int | None":
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class Settings:
     """Resolved runtime settings."""
@@ -52,6 +72,12 @@ class Settings:
     telegram_bot_token: str
     openai_api_key: str
     openai_model: str
+    openai_temperature: "float | None"
+    openai_reasoning_effort: str
+    openai_max_tokens: "int | None"
+    parser_mode: str
+    openai_transcribe_model: str
+    openai_transcribe_language: str
     db_path: str
     expiry_reminder_days: int
     reminder_hour: int
@@ -76,6 +102,18 @@ def get_settings() -> Settings:
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
         openai_model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        openai_temperature=_get_optional_float("OPENAI_TEMPERATURE"),
+        openai_reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", ""),
+        openai_max_tokens=_get_optional_int("OPENAI_MAX_TOKENS"),
+        parser_mode=os.environ.get("PARSER_MODE", "llm").strip().lower() or "llm",
+        openai_transcribe_model=os.environ.get(
+            "OPENAI_TRANSCRIBE_MODEL", "whisper-1"
+        ),
+        # Default to English to avoid Whisper misdetecting language on short
+        # clips. Set to "" for auto-detect, or another ISO-639-1 code.
+        openai_transcribe_language=os.environ.get(
+            "OPENAI_TRANSCRIBE_LANGUAGE", "en"
+        ),
         db_path=os.environ.get("DB_PATH", str(PROJECT_ROOT / "fridge.db")),
         expiry_reminder_days=_get_int("EXPIRY_REMINDER_DAYS", 2),
         reminder_hour=reminder_hour,

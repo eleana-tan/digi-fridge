@@ -19,8 +19,10 @@ from fridge.models import (
     QUERY_EXPIRING,
     QUERY_HAVE_ITEM,
     QUERY_LIST_ALL,
+    ParsedAction,
 )
 from fridge.parser import (
+    HybridParser,
     LLMParser,
     RuleBasedParser,
     infer_category,
@@ -165,6 +167,63 @@ class LLMParserTests(unittest.TestCase):
         parser = LLMParser(client=_StubClient("not json at all"))
         action = parser.parse("hi")
         self.assertEqual(action.action, ACTION_UNKNOWN)
+
+    def test_temperature_omitted_by_default(self):
+        # Newer models reject a non-default temperature, so we must not send it
+        # unless explicitly configured.
+        client = _StubClient('{"action": "unknown"}')
+        LLMParser(client=client).parse("hi")
+        self.assertNotIn("temperature", client.chat.completions.last_kwargs)
+
+    def test_temperature_sent_when_configured(self):
+        client = _StubClient('{"action": "unknown"}')
+        LLMParser(client=client, temperature=0).parse("hi")
+        self.assertEqual(client.chat.completions.last_kwargs["temperature"], 0)
+
+    def test_latency_options_forwarded(self):
+        client = _StubClient('{"action": "unknown"}')
+        LLMParser(
+            client=client, reasoning_effort="minimal", max_completion_tokens=200
+        ).parse("hi")
+        kwargs = client.chat.completions.last_kwargs
+        self.assertEqual(kwargs["reasoning_effort"], "minimal")
+        self.assertEqual(kwargs["max_completion_tokens"], 200)
+
+
+class _RecordingParser:
+    """Test double that records whether it was called and returns a canned action."""
+
+    def __init__(self, action):
+        self.action = action
+        self.called = False
+
+    def parse(self, message):
+        self.called = True
+        return self.action
+
+
+class HybridParserTests(unittest.TestCase):
+    def test_simple_message_uses_fast_path(self):
+        slow = _RecordingParser(ParsedAction(action=ACTION_UNKNOWN))
+        hybrid = HybridParser(fast=RuleBasedParser(), slow=slow)
+        result = hybrid.parse("bought milk and eggs")
+        self.assertEqual(result.action, ACTION_ADD)
+        self.assertFalse(slow.called)  # LLM not consulted
+
+    def test_date_message_defers_to_llm(self):
+        canned = ParsedAction(action=ACTION_ADD)
+        slow = _RecordingParser(canned)
+        hybrid = HybridParser(fast=RuleBasedParser(), slow=slow)
+        hybrid.parse("bought milk that expires tomorrow")
+        self.assertTrue(slow.called)  # deferred to LLM due to date hint
+
+    def test_low_confidence_defers_to_llm(self):
+        canned = ParsedAction(action=ACTION_ADD)
+        slow = _RecordingParser(canned)
+        hybrid = HybridParser(fast=RuleBasedParser(), slow=slow)
+        # Gibberish the rule parser can't confidently handle -> LLM.
+        hybrid.parse("hmm not sure")
+        self.assertTrue(slow.called)
 
 
 class RuleBasedParserTests(unittest.TestCase):

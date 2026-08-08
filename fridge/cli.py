@@ -45,7 +45,12 @@ def main() -> None:
 
     conn = db.connect(args.db)
     parser = build_parser(
-        openai_api_key=settings.openai_api_key, model=settings.openai_model
+        openai_api_key=settings.openai_api_key,
+        model=settings.openai_model,
+        temperature=settings.openai_temperature,
+        mode=settings.parser_mode,
+        reasoning_effort=settings.openai_reasoning_effort,
+        max_completion_tokens=settings.openai_max_tokens,
     )
     kind = "LLM" if settings.has_openai else "rule-based"
     print(f"[using {kind} parser, db={args.db}, user={args.user}]")
