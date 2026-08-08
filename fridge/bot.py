@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from datetime import time as dt_time
@@ -173,7 +174,14 @@ def _should_process_group_message(
 
 # Telegram clears chat-action status after ~5s; refresh sooner so it never gaps.
 _TYPING_INTERVAL_S = 2.5
-_PROGRESS_PLACEHOLDER = "\u2026"  # visible until we edit in the real reply
+# Shown briefly, then edited into the real reply.
+_PROGRESS_PLACEHOLDERS = (
+    "One sec — looking that up…",
+    "On it — give me a moment…",
+    "Hang tight, working on that…",
+    "Okay, let me check…",
+    "Just a moment…",
+)
 
 
 class ProgressReply:
@@ -234,7 +242,7 @@ async def typing_while(
     status: Message | None = None
     if message is not None:
         try:
-            status = await message.reply_text(_PROGRESS_PLACEHOLDER)
+            status = await message.reply_text(random.choice(_PROGRESS_PLACEHOLDERS))
         except Exception:  # noqa: BLE001
             logger.debug("Could not send progress placeholder", exc_info=True)
 
