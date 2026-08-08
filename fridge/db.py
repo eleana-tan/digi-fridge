@@ -59,6 +59,21 @@ _MIGRATIONS: list[tuple[int, str]] = [
         );
         """,
     ),
+    (
+        2,
+        # Introduce a "scope" so a group chat can be one shared fridge while each
+        # item keeps its attribution in ``user_id`` (who added it). In DMs the
+        # scope is ``user:<handle>``; in groups it's ``chat:<group_id>``.
+        # Existing rows are backfilled to their owner's personal scope.
+        """
+        ALTER TABLE inventory ADD COLUMN scope_key TEXT;
+        UPDATE inventory SET scope_key = 'user:' || user_id WHERE scope_key IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_inventory_scope
+            ON inventory (scope_key);
+        CREATE INDEX IF NOT EXISTS idx_inventory_scope_name
+            ON inventory (scope_key, item_name);
+        """,
+    ),
 ]
 
 
@@ -141,53 +156,81 @@ def get_chat_id(conn: sqlite3.Connection, user_id: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 # Inventory reads
 # ---------------------------------------------------------------------------
-def get_items(conn: sqlite3.Connection, user_id: str) -> list[InventoryItem]:
+def get_items(conn: sqlite3.Connection, scope_key: str) -> list[InventoryItem]:
+    """All items in a scope (a user's DM fridge or a group's shared fridge)."""
     rows = conn.execute(
         """
         SELECT * FROM inventory
-        WHERE user_id = ?
-        ORDER BY (expires_on IS NULL), expires_on, item_name
+        WHERE scope_key = ?
+        ORDER BY (expires_on IS NULL), expires_on, item_name, user_id
         """,
-        (user_id,),
+        (scope_key,),
     ).fetchall()
     return [_row_to_item(r) for r in rows]
 
 
 def find_item(
-    conn: sqlite3.Connection, user_id: str, item_name: str
+    conn: sqlite3.Connection,
+    scope_key: str,
+    item_name: str,
+    prefer_user: Optional[str] = None,
 ) -> Optional[InventoryItem]:
-    """Case-insensitive lookup of a single item by name."""
-    row = conn.execute(
-        """
-        SELECT * FROM inventory
-        WHERE user_id = ? AND LOWER(item_name) = LOWER(?)
-        ORDER BY id
-        LIMIT 1
-        """,
-        (user_id, item_name.strip()),
-    ).fetchone()
-    return _row_to_item(row) if row else None
+    """Case-insensitive lookup of a single item by name within a scope.
 
-
-def search_items(
-    conn: sqlite3.Connection, user_id: str, term: str
-) -> list[InventoryItem]:
-    """Fuzzy-ish search: items whose name contains ``term``."""
+    When several people in a group have the same item, ``prefer_user`` selects
+    that person's row first (used so "I used the milk" affects your own).
+    """
     rows = conn.execute(
         """
         SELECT * FROM inventory
-        WHERE user_id = ? AND LOWER(item_name) LIKE LOWER(?)
-        ORDER BY item_name
+        WHERE scope_key = ? AND LOWER(item_name) = LOWER(?)
+        ORDER BY id
         """,
-        (user_id, f"%{term.strip()}%"),
+        (scope_key, item_name.strip()),
+    ).fetchall()
+    if not rows:
+        return None
+    if prefer_user is not None:
+        for row in rows:
+            if row["user_id"] == prefer_user:
+                return _row_to_item(row)
+    return _row_to_item(rows[0])
+
+
+def search_items(
+    conn: sqlite3.Connection, scope_key: str, term: str
+) -> list[InventoryItem]:
+    """Fuzzy-ish search within a scope: items whose name contains ``term``."""
+    rows = conn.execute(
+        """
+        SELECT * FROM inventory
+        WHERE scope_key = ? AND LOWER(item_name) LIKE LOWER(?)
+        ORDER BY item_name, user_id
+        """,
+        (scope_key, f"%{term.strip()}%"),
+    ).fetchall()
+    return [_row_to_item(r) for r in rows]
+
+
+def get_items_by_user(
+    conn: sqlite3.Connection, scope_key: str, user_id: str
+) -> list[InventoryItem]:
+    """Items in a scope attributed to a specific contributor."""
+    rows = conn.execute(
+        """
+        SELECT * FROM inventory
+        WHERE scope_key = ? AND LOWER(user_id) = LOWER(?)
+        ORDER BY (expires_on IS NULL), expires_on, item_name
+        """,
+        (scope_key, user_id.strip().lstrip("@")),
     ).fetchall()
     return [_row_to_item(r) for r in rows]
 
 
 def get_expiring(
-    conn: sqlite3.Connection, user_id: str, within_days: int, today: Optional[str] = None
+    conn: sqlite3.Connection, scope_key: str, within_days: int, today: Optional[str] = None
 ) -> list[InventoryItem]:
-    """Items with an ``expires_on`` on or before today + ``within_days``.
+    """Items in a scope with ``expires_on`` on or before today + ``within_days``.
 
     ``today`` may be supplied (ISO date) for deterministic testing.
     """
@@ -196,62 +239,93 @@ def get_expiring(
     rows = conn.execute(
         """
         SELECT * FROM inventory
-        WHERE user_id = ?
+        WHERE scope_key = ?
           AND expires_on IS NOT NULL
           AND date(expires_on) <= date(?, '+' || ? || ' days')
         ORDER BY expires_on
         """,
-        (user_id, today, within_days),
+        (scope_key, today, within_days),
     ).fetchall()
     return [_row_to_item(r) for r in rows]
 
 
-def users_with_expiring(
+def scopes_with_expiring(
     conn: sqlite3.Connection, within_days: int, today: Optional[str] = None
 ) -> list[str]:
-    """Distinct user_ids that have at least one soon-to-expire item."""
+    """Distinct scopes that have at least one soon-to-expire item."""
     if today is None:
         today = datetime.now(timezone.utc).date().isoformat()
     rows = conn.execute(
         """
-        SELECT DISTINCT user_id FROM inventory
+        SELECT DISTINCT scope_key FROM inventory
         WHERE expires_on IS NOT NULL
           AND date(expires_on) <= date(?, '+' || ? || ' days')
         """,
         (today, within_days),
     ).fetchall()
-    return [r["user_id"] for r in rows]
+    return [r["scope_key"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
 # Inventory writes
 # ---------------------------------------------------------------------------
+def _find_own_item(
+    conn: sqlite3.Connection, scope_key: str, item_name: str, added_by: str
+) -> Optional[InventoryItem]:
+    """Find the row in a scope for a specific contributor (attribution match)."""
+    row = conn.execute(
+        """
+        SELECT * FROM inventory
+        WHERE scope_key = ? AND user_id = ? AND LOWER(item_name) = LOWER(?)
+        ORDER BY id
+        LIMIT 1
+        """,
+        (scope_key, added_by, item_name.strip()),
+    ).fetchone()
+    return _row_to_item(row) if row else None
+
+
 def add_or_increment(
     conn: sqlite3.Connection,
-    user_id: str,
+    scope_key: str,
     item_name: str,
     item_qty: Optional[float] = None,
     unit: Optional[str] = None,
     expires_on: Optional[str] = None,
     category: Optional[str] = None,
+    added_by: Optional[str] = None,
 ) -> tuple[InventoryItem, bool]:
-    """Add a new item, or increment the quantity if it already exists.
+    """Add a new item, or increment the contributor's existing quantity.
 
-    Returns ``(item, created)`` where ``created`` is True for a fresh row.
-    Non-null ``unit``/``expires_on``/``category`` overwrite existing values.
+    Items are attributed to ``added_by`` (defaults to the scope for personal
+    fridges). In a group, two people adding "milk" keep separate attributed
+    rows. Returns ``(item, created)``; non-null unit/expires_on/category
+    overwrite existing values.
     """
+    if added_by is None:
+        added_by = scope_key
     qty = 1.0 if item_qty is None else float(item_qty)
     now = utcnow_iso()
-    existing = find_item(conn, user_id, item_name)
+    existing = _find_own_item(conn, scope_key, item_name, added_by)
     if existing is None:
         cur = conn.execute(
             """
             INSERT INTO inventory
-                (user_id, item_name, item_qty, unit, created_ts, updated_ts,
-                 expires_on, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (user_id, scope_key, item_name, item_qty, unit, created_ts,
+                 updated_ts, expires_on, category)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, item_name.strip(), qty, unit, now, now, expires_on, category),
+            (
+                added_by,
+                scope_key,
+                item_name.strip(),
+                qty,
+                unit,
+                now,
+                now,
+                expires_on,
+                category,
+            ),
         )
         conn.commit()
         created_row = conn.execute(
@@ -281,17 +355,19 @@ def add_or_increment(
 
 def remove_quantity(
     conn: sqlite3.Connection,
-    user_id: str,
+    scope_key: str,
     item_name: str,
     item_qty: Optional[float] = None,
     remove_all: bool = False,
+    prefer_user: Optional[str] = None,
 ) -> tuple[str, Optional[InventoryItem]]:
-    """Reduce quantity or delete an item.
+    """Reduce quantity or delete an item within a scope.
 
-    Returns ``(status, item_or_none)`` where status is one of:
-    ``"not_found"``, ``"deleted"``, or ``"reduced"``.
+    In a shared group fridge, ``prefer_user`` targets the caller's own item
+    first when multiple people have the same item. Returns ``(status, item)``
+    where status is ``"not_found"``, ``"deleted"``, or ``"reduced"``.
     """
-    existing = find_item(conn, user_id, item_name)
+    existing = find_item(conn, scope_key, item_name, prefer_user=prefer_user)
     if existing is None:
         return "not_found", None
 
@@ -321,18 +397,19 @@ def remove_quantity(
 
 def update_item(
     conn: sqlite3.Connection,
-    user_id: str,
+    scope_key: str,
     item_name: str,
     item_qty: Optional[float] = None,
     unit: Optional[str] = None,
     expires_on: Optional[str] = None,
     category: Optional[str] = None,
+    prefer_user: Optional[str] = None,
 ) -> Optional[InventoryItem]:
     """Overwrite specified fields of an existing item. Non-null values win.
 
     Returns the updated item, or None if it doesn't exist.
     """
-    existing = find_item(conn, user_id, item_name)
+    existing = find_item(conn, scope_key, item_name, prefer_user=prefer_user)
     if existing is None:
         return None
     now = utcnow_iso()
@@ -355,8 +432,8 @@ def update_item(
     return _row_to_item(updated)
 
 
-def delete_item(conn: sqlite3.Connection, user_id: str, item_name: str) -> bool:
-    existing = find_item(conn, user_id, item_name)
+def delete_item(conn: sqlite3.Connection, scope_key: str, item_name: str) -> bool:
+    existing = find_item(conn, scope_key, item_name)
     if existing is None:
         return False
     conn.execute("DELETE FROM inventory WHERE id = ?", (existing.id,))

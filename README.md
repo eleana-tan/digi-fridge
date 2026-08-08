@@ -21,6 +21,7 @@ parsing/logic without a live Telegram connection.
 | `fridge/db.py` | SQLite storage, migrations, CRUD, action log | no | no |
 | `fridge/parser.py` | Message → structured action (LLM **or** rule-based) | no | only LLM path |
 | `fridge/transcribe.py` | Voice audio → text (OpenAI) | no | only voice path |
+| `fridge/vision.py` | Grocery/receipt photo → proposed items (OpenAI) | no | only photo path |
 | `fridge/actions.py` | Execute action against DB, build reply | no | no |
 | `fridge/reminders.py` | Find expiring items + notify | delivery only | no |
 | `fridge/bot.py` | Telegram wiring / entrypoint | **yes** | yes |
@@ -33,14 +34,36 @@ The parser has two implementations behind one interface:
 - **`RuleBasedParser`** — dependency-free heuristics. Used automatically when
   `OPENAI_API_KEY` is not set, so the app runs and is testable fully offline.
 
-### Multiple users
+### Multiple users, groups, and attribution
 
-Every item, query, and reminder is keyed by a per-message `user_id` (the
-Telegram username, or a stable `chat:<id>` fallback), so each user gets their
-own isolated inventory automatically — no shared state between users. The
-blocking LLM/transcription calls run in worker threads (`asyncio.to_thread`), so
-one user's slow request never stalls the bot for everyone else; database access
-stays on the event-loop thread, keeping SQLite access single-threaded and safe.
+Inventory lives in a **scope**:
+
+- In a **direct message**, the scope is the user's personal fridge
+  (`user:<handle>`) — private, isolated per person.
+- In a **group chat**, the scope is one **shared fridge** for the group
+  (`chat:<id>`), and every item records **who added it** (`user_id`). Ordinary
+  list / "do we have milk?" / expiring replies do **not** show buyers. Ask
+  explicitly: `who bought the milk?`, `whose eggs are these?`, or
+  `what did alice buy?`.
+
+The blocking LLM/transcription/vision calls run in worker threads
+(`asyncio.to_thread`), so one user's slow request never stalls the bot for
+everyone else; all database access stays on the event-loop thread, keeping
+SQLite single-threaded and safe. (Schema migration `v2` adds the `scope_key`
+column and backfills existing rows to each owner's personal scope.)
+
+### Photo logging (verify + edit before save)
+
+Send a photo of a **receipt** or your **groceries laid out**. The bot uses a
+vision model (`OPENAI_VISION_MODEL`, default `gpt-4o-mini`) to extract items,
+then shows a numbered draft. **Nothing is written until you confirm.**
+
+Hybrid confirmation (buttons + text):
+
+- Buttons: **Add all** / **Cancel**
+- Or type: `yes` / `no`, `remove 2`, `remove milk`, `change 1 to 3 cartons milk`
+
+On confirm, items go through the same add pipeline (scope + attribution).
 
 ### Voice messages
 
@@ -92,6 +115,7 @@ cp .env.example .env   # then edit .env
   latency sharply. Leave blank for non-reasoning models.
 - `OPENAI_MAX_TOKENS` — optional cap on the parser's output tokens.
 - `OPENAI_TRANSCRIBE_MODEL` — voice transcription model, defaults to `whisper-1`.
+- `OPENAI_VISION_MODEL` — photo item-extraction model, defaults to `gpt-4o-mini`.
 - `DB_PATH` — SQLite file, defaults to `fridge.db`.
 - `EXPIRY_REMINDER_DAYS` — reminder window, defaults to `2`.
 - `REMINDER_TIME` — daily reminder time `HH:MM` in the server's local timezone,
@@ -119,7 +143,7 @@ Do these in order. Don't move on to step N+1 until step N works.
 python -m unittest discover -s tests -v
 ```
 
-Expect `OK` with 46 tests. This exercises the DB layer, the parser (pure JSON
+Expect `OK` with 72 tests. This exercises the DB layer, the parser (pure JSON
 transform + stubbed LLM client + rule-based parser), the action layer, and the
 reminder-building logic — all without Telegram or a network.
 
@@ -207,7 +231,29 @@ With the live bot running (or via `python -m fridge.cli`):
 
 - `what do I have?` → lists your inventory.
 - `what's expiring soon?` → lists items expiring within the next few days.
-- `do I have milk?` → `Yes, you have: ...` or `No, you don't have any milk.`
+- `do I have milk?` → `Yes: ...` or `No, there's no milk here.`
+
+### Step 7 — Group attribution (shared fridge)
+
+Add the bot to a Telegram **group** with another person, then:
+
+- Have user A send `bought 2 cartons of milk` and user B send `bought a dozen eggs`.
+- Anyone sends `what do we have?` → shared list **without** buyer names.
+- Send `who bought the milk?` → `Here's who bought milk: - 2 cartons milk — @A`.
+- Send `what did alice buy?` → only Alice's items.
+
+Offline, the DB/attribution logic is covered by
+`python -m unittest tests.test_db tests.test_actions tests.test_parser -v`.
+
+### Step 8 — Photo logging (verify + edit before saving)
+
+Requires `OPENAI_API_KEY`. Send the bot a **photo** of a receipt or groceries:
+
+- It replies with a numbered draft plus **Add all / Cancel** buttons.
+- Edit first if needed: `remove 2`, `change 1 to 3 eggs`, then `yes` (or tap Add all).
+- Tap **Cancel** / type `no` → nothing is saved.
+
+Offline: `python -m unittest tests.test_vision tests.test_pending -v`.
 
 ## Project layout
 
@@ -219,6 +265,8 @@ fridge/
   db.py            SQLite storage, migrations, CRUD, action log
   parser.py        LLMParser (injectable client) + RuleBasedParser
   transcribe.py    OpenAITranscriber (voice -> text)
+  vision.py        OpenAIImageExtractor (photo -> proposed items)
+  pending.py       draft edit/confirm helpers for photo proposals
   actions.py       execute ParsedAction -> reply text
   reminders.py     build_reminders (pure) + send_daily_reminders (Telegram)
   bot.py           Telegram handlers + entrypoint
@@ -231,6 +279,7 @@ requirements.txt
 
 ## Non-goals (this pass)
 
-Per-user inventories are supported (each Telegram user has their own fridge),
-but there are no *shared* households/fridges yet. No recipe suggestions and no
-photo/receipt scanning yet. No auth beyond the Telegram user/chat id.
+Per-user inventories (DMs) and shared group fridges with per-item attribution
+are supported, along with voice input and photo/receipt logging. Still out of
+scope this pass: recipe suggestions, and any auth beyond the Telegram
+user/chat id. Photo extraction always asks you to confirm before saving.

@@ -20,6 +20,8 @@ ACTION_UNKNOWN = "unknown"
 QUERY_LIST_ALL = "list_all"
 QUERY_EXPIRING = "expiring_soon"
 QUERY_HAVE_ITEM = "have_item"
+QUERY_WHO_HAS = "who_has"  # "who bought the milk?" (item -> buyers)
+QUERY_BY_USER = "by_user"  # "what did Alice buy?" (user -> their items)
 
 
 @dataclass

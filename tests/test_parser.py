@@ -19,6 +19,8 @@ from fridge.models import (
     QUERY_EXPIRING,
     QUERY_HAVE_ITEM,
     QUERY_LIST_ALL,
+    QUERY_BY_USER,
+    QUERY_WHO_HAS,
     ParsedAction,
 )
 from fridge.parser import (
@@ -271,6 +273,29 @@ class RuleBasedParserTests(unittest.TestCase):
         self.assertEqual(action.action, ACTION_QUERY)
         self.assertEqual(action.query_type, QUERY_HAVE_ITEM)
         self.assertEqual(action.query_target, "milk")
+
+    def test_query_who_bought(self):
+        action = self.parser.parse("who bought the milk?")
+        self.assertEqual(action.action, ACTION_QUERY)
+        self.assertEqual(action.query_type, QUERY_WHO_HAS)
+        self.assertEqual(action.query_target, "milk")
+
+    def test_query_whose(self):
+        action = self.parser.parse("whose eggs are these?")
+        self.assertEqual(action.action, ACTION_QUERY)
+        self.assertEqual(action.query_type, QUERY_WHO_HAS)
+        self.assertEqual(action.query_target, "eggs")
+
+    def test_query_by_user(self):
+        action = self.parser.parse("what did alice buy?")
+        self.assertEqual(action.action, ACTION_QUERY)
+        self.assertEqual(action.query_type, QUERY_BY_USER)
+        self.assertEqual(action.query_target, "alice")
+
+    def test_query_we_have(self):
+        action = self.parser.parse("what do we have?")
+        self.assertEqual(action.action, ACTION_QUERY)
+        self.assertEqual(action.query_type, QUERY_LIST_ALL)
 
     def test_bare_items_default_to_add(self):
         action = self.parser.parse("milk, bread, eggs")

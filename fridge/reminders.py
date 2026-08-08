@@ -18,9 +18,26 @@ from .actions import _fmt_item
 
 @dataclass
 class Reminder:
-    user_id: str
+    scope_key: str
     chat_id: int
     text: str
+
+
+def _chat_id_for_scope(conn: sqlite3.Connection, scope_key: str) -> Optional[int]:
+    """Resolve where to send a reminder for a given scope.
+
+    - ``chat:<id>``  -> that group chat id (parsed directly).
+    - ``user:<name>``-> the user's DM chat id (from the ``users`` table).
+    - anything else  -> looked up as a bare user handle (back-compat).
+    """
+    if scope_key.startswith("chat:"):
+        try:
+            return int(scope_key[len("chat:"):])
+        except ValueError:
+            return None
+    if scope_key.startswith("user:"):
+        return db.get_chat_id(conn, scope_key[len("user:"):])
+    return db.get_chat_id(conn, scope_key)
 
 
 def format_reminder_text(items) -> str:
@@ -36,22 +53,22 @@ def build_reminders(
     within_days: int,
     today: Optional[str] = None,
 ) -> list[Reminder]:
-    """Return one :class:`Reminder` per user who has soon-to-expire items.
+    """Return one :class:`Reminder` per scope that has soon-to-expire items.
 
-    Users without a known chat id (never messaged the bot) are skipped, since
-    there's no way to reach them.
+    Scopes we can't reach (e.g. a user who never messaged the bot in DM) are
+    skipped, since there's no chat to message.
     """
     reminders: list[Reminder] = []
-    for user_id in db.users_with_expiring(conn, within_days, today=today):
-        chat_id = db.get_chat_id(conn, user_id)
+    for scope_key in db.scopes_with_expiring(conn, within_days, today=today):
+        chat_id = _chat_id_for_scope(conn, scope_key)
         if chat_id is None:
             continue
-        items = db.get_expiring(conn, user_id, within_days, today=today)
+        items = db.get_expiring(conn, scope_key, within_days, today=today)
         if not items:
             continue
         reminders.append(
             Reminder(
-                user_id=user_id,
+                scope_key=scope_key,
                 chat_id=chat_id,
                 text=format_reminder_text(items),
             )

@@ -31,7 +31,9 @@ def run_once(conn, parser, user_id: str, message: str, *, show_parse: bool) -> s
     db.log_action(conn, user_id, message, json.dumps(asdict(parsed)))
     if show_parse:
         print("  parsed:", json.dumps(asdict(parsed), indent=2))
-    return actions.execute(conn, user_id, parsed)
+    # Behave like a personal DM fridge for the CLI user.
+    scope_key = f"user:{user_id}"
+    return actions.execute(conn, scope_key, parsed, added_by=user_id, is_group=False)
 
 
 def main() -> None:

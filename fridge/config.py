@@ -78,6 +78,7 @@ class Settings:
     parser_mode: str
     openai_transcribe_model: str
     openai_transcribe_language: str
+    openai_vision_model: str
     db_path: str
     expiry_reminder_days: int
     reminder_hour: int
@@ -114,6 +115,7 @@ def get_settings() -> Settings:
         openai_transcribe_language=os.environ.get(
             "OPENAI_TRANSCRIBE_LANGUAGE", "en"
         ),
+        openai_vision_model=os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini"),
         db_path=os.environ.get("DB_PATH", str(PROJECT_ROOT / "fridge.db")),
         expiry_reminder_days=_get_int("EXPIRY_REMINDER_DAYS", 2),
         reminder_hour=reminder_hour,

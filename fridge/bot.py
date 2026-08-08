@@ -21,9 +21,10 @@ import os
 from dataclasses import asdict
 from datetime import time as dt_time
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -32,9 +33,21 @@ from telegram.ext import (
 
 from . import actions, db
 from .config import Settings, get_settings
+from .models import ACTION_ADD, ItemSpec, ParsedAction
 from .parser import build_parser
+from .pending import (
+    STATUS_CANCELLED,
+    STATUS_CONFIRMED,
+    STATUS_ERROR,
+    STATUS_NOT_AN_EDIT,
+    STATUS_UPDATED,
+    apply_pending_edit,
+    edit_help_text,
+    format_pending,
+)
 from .reminders import send_daily_reminders
 from .transcribe import build_transcriber
+from .vision import build_image_extractor
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -50,18 +63,42 @@ WELCOME = (
     '- "what do I have?"\n'
     '- "what\'s expiring soon?"\n'
     '- "do I have milk?"\n\n'
-    "You can also send me a voice message and I'll transcribe it.\n"
+    "You can also:\n"
+    "- send a voice message and I'll transcribe it\n"
+    "- send a photo of a receipt or groceries — I'll propose items; confirm, "
+    "cancel, or edit (e.g. remove 2 / change 1 to 3 eggs) before anything is saved\n\n"
+    "In a group chat I keep one shared fridge and remember who added what. "
+    'Ask "who bought the milk?" or "what did alice buy?" for attribution '
+    "(ordinary lists don't show buyers).\n"
     "I'll also remind you when things are about to expire."
 )
 
 
 def resolve_user_id(update: Update) -> str:
-    """Prefer the Telegram username; fall back to a stable chat-id handle."""
+    """A stable handle for the user who sent the update (attribution)."""
     user = update.effective_user
     if user and user.username:
         return user.username
+    if user and user.first_name:
+        return user.first_name
+    if user:
+        return f"user{user.id}"
     chat = update.effective_chat
     return f"chat:{chat.id}" if chat else "unknown"
+
+
+def resolve_scope(update: Update) -> tuple[str, str, bool]:
+    """Return ``(scope_key, added_by, is_group)`` for this update.
+
+    - In a group/supergroup the scope is the shared ``chat:<id>`` fridge.
+    - In a private chat the scope is the user's personal ``user:<handle>`` fridge.
+    ``added_by`` is always the individual user, so group items stay attributed.
+    """
+    added_by = resolve_user_id(update)
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        return f"chat:{chat.id}", added_by, True
+    return f"user:{added_by}", added_by, False
 
 
 # ---------------------------------------------------------------------------
@@ -90,13 +127,12 @@ async def _process_text(
     Database access stays on the event-loop thread, keeping SQLite access
     single-threaded and safe.
     """
-    user_id = resolve_user_id(update)
+    scope_key, added_by, is_group = resolve_scope(update)
     conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
     parser = context.application.bot_data["parser"]
 
-    # Remember how to reach this user for background reminders.
+    _remember_dm(conn, update, added_by)
     if update.effective_chat:
-        db.remember_user(conn, user_id, update.effective_chat.id)
         # Immediate feedback while the (possibly slow) parse runs.
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action="typing"
@@ -106,20 +142,35 @@ async def _process_text(
         parsed = await asyncio.to_thread(parser.parse, message_text)
     except Exception:  # noqa: BLE001 - never crash the handler on parse errors
         logger.exception("Parser failed for message: %r", message_text)
-        db.log_action(conn, user_id, message_text, "PARSE_ERROR")
+        db.log_action(conn, added_by, message_text, "PARSE_ERROR")
         await update.message.reply_text(
             "Sorry, I had trouble understanding that. Please try rephrasing."
         )
         return
 
-    db.log_action(conn, user_id, message_text, json.dumps(asdict(parsed)))
-    reply = actions.execute(conn, user_id, parsed)
+    db.log_action(conn, added_by, message_text, json.dumps(asdict(parsed)))
+    reply = actions.execute(
+        conn, scope_key, parsed, added_by=added_by, is_group=is_group
+    )
     await update.message.reply_text(reply)
 
 
+def _remember_dm(conn, update: Update, added_by: str) -> None:
+    """Record a user's DM chat id (private chats only) for personal reminders."""
+    chat = update.effective_chat
+    if chat and chat.type == "private":
+        db.remember_user(conn, added_by, chat.id)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle a typed text message."""
-    await _process_text(update, context, update.message.text or "")
+    """Handle a typed text message (or a pending photo-draft edit)."""
+    text = update.message.text or ""
+    # If a photo draft is waiting, try to treat the text as an edit/confirm first.
+    if context.user_data.get("pending_photo_items") is not None:
+        handled = await _try_pending_photo_text(update, context, text)
+        if handled:
+            return
+    await _process_text(update, context, text)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -171,6 +222,165 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ---------------------------------------------------------------------------
+# Photo logging (extract -> verify/edit -> confirm)
+# ---------------------------------------------------------------------------
+def _photo_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("\u2705 Add all", callback_data="img_confirm"),
+                InlineKeyboardButton("\u274c Cancel", callback_data="img_cancel"),
+            ]
+        ]
+    )
+
+
+def _photo_proposal_text(items: list[ItemSpec], *, preface: str = "") -> str:
+    body = (
+        f"{preface}\n\n" if preface else ""
+    ) + (
+        "I found these items:\n"
+        f"{format_pending(items)}\n\n"
+        f"{edit_help_text()}"
+    )
+    return body
+
+
+async def _commit_pending_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    items: list[ItemSpec],
+    *,
+    via_callback: bool,
+) -> None:
+    """Write pending items to the DB and clear the draft."""
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    scope_key, added_by, is_group = resolve_scope(update)
+    action = ParsedAction(action=ACTION_ADD, items=items)
+    reply = actions.execute(
+        conn, scope_key, action, added_by=added_by, is_group=is_group
+    )
+    context.user_data.pop("pending_photo_items", None)
+    db.log_action(conn, added_by, "<photo confirm>", f"VISION_ADDED:{len(items)}")
+    text = f"Done!\n{reply}"
+    if via_callback:
+        await update.callback_query.edit_message_text(text)
+    else:
+        await update.message.reply_text(text)
+
+
+async def _try_pending_photo_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> bool:
+    """Handle confirm/cancel/edit text against a pending photo draft.
+
+    Returns True if the message was consumed (caller should not run the
+    normal inventory pipeline).
+    """
+    items: list[ItemSpec] = list(context.user_data.get("pending_photo_items") or [])
+    status, new_items, fragment = apply_pending_edit(items, text)
+
+    if status == STATUS_NOT_AN_EDIT:
+        return False
+
+    if status == STATUS_CANCELLED:
+        context.user_data.pop("pending_photo_items", None)
+        await update.message.reply_text("Okay, I didn't add anything.")
+        return True
+
+    if status == STATUS_CONFIRMED:
+        await _commit_pending_photo(update, context, new_items, via_callback=False)
+        return True
+
+    if status == STATUS_ERROR:
+        await update.message.reply_text(
+            f"{fragment}\n\nCurrent draft:\n{format_pending(items)}\n\n"
+            f"{edit_help_text()}",
+            reply_markup=_photo_keyboard(),
+        )
+        return True
+
+    # STATUS_UPDATED
+    context.user_data["pending_photo_items"] = new_items
+    if not new_items:
+        context.user_data.pop("pending_photo_items", None)
+        await update.message.reply_text(
+            f"{fragment}\nDraft is empty — nothing to add. Send another photo if you like."
+        )
+        return True
+    await update.message.reply_text(
+        f"{fragment}\n\nUpdated draft:\n{format_pending(new_items)}\n\n"
+        f"{edit_help_text()}",
+        reply_markup=_photo_keyboard(),
+    )
+    return True
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A photo (receipt / groceries): extract items and ask to confirm/edit."""
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    extractor = context.application.bot_data.get("image_extractor")
+    added_by = resolve_user_id(update)
+
+    if extractor is None:
+        await update.message.reply_text(
+            "Photo logging needs an OpenAI API key for image understanding. "
+            "Set OPENAI_API_KEY in .env, or add items by text."
+        )
+        return
+
+    if not update.message.photo:
+        return
+
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action="typing"
+    )
+    try:
+        # The last PhotoSize is the highest resolution.
+        tg_file = await update.message.photo[-1].get_file()
+        image_bytes = bytes(await tg_file.download_as_bytearray())
+        items = await asyncio.to_thread(extractor.extract, image_bytes, "image/jpeg")
+    except Exception:  # noqa: BLE001 - never crash the handler
+        logger.exception("Image extraction failed")
+        db.log_action(conn, added_by, "<photo>", "VISION_ERROR")
+        await update.message.reply_text(
+            "Sorry, I couldn't read that image. Try a clearer photo or add by text."
+        )
+        return
+
+    if not items:
+        await update.message.reply_text(
+            "I couldn't spot any grocery items in that photo. "
+            "Try a clearer shot, or just type what you bought."
+        )
+        return
+
+    # Stash the proposed items for this user until they confirm/cancel/edit.
+    context.user_data["pending_photo_items"] = items
+    db.log_action(conn, added_by, "<photo>", f"VISION_PROPOSED:{len(items)}")
+
+    await update.message.reply_text(
+        _photo_proposal_text(items),
+        reply_markup=_photo_keyboard(),
+    )
+
+
+async def on_photo_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the Confirm/Cancel buttons under a proposed photo extraction."""
+    query = update.callback_query
+    await query.answer()
+
+    items: list[ItemSpec] = context.user_data.get("pending_photo_items") or []
+
+    if query.data == "img_cancel" or not items:
+        context.user_data.pop("pending_photo_items", None)
+        await query.edit_message_text("Okay, I didn't add anything.")
+        return
+
+    await _commit_pending_photo(update, context, items, via_callback=True)
+
+
+# ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
 def build_application(settings: Settings) -> Application:
@@ -208,23 +418,29 @@ def build_application(settings: Settings) -> Application:
         model=settings.openai_transcribe_model,
         language=settings.openai_transcribe_language,
     )
+    image_extractor = build_image_extractor(
+        openai_api_key=settings.openai_api_key,
+        model=settings.openai_vision_model,
+    )
     if settings.has_openai:
         logger.info(
-            "Using parser mode=%s (model=%s) and voice transcription (model=%s).",
+            "Using parser mode=%s (model=%s), voice (model=%s), vision (model=%s).",
             settings.parser_mode,
             settings.openai_model,
             settings.openai_transcribe_model,
+            settings.openai_vision_model,
         )
     else:
         logger.warning(
-            "OPENAI_API_KEY not set - using the offline rule-based parser and "
-            "voice input is disabled. Set OPENAI_API_KEY in .env for full "
-            "natural-language understanding and voice support."
+            "OPENAI_API_KEY not set - using the offline rule-based parser; "
+            "voice and photo logging are disabled. Set OPENAI_API_KEY in .env "
+            "for full natural-language understanding, voice, and image support."
         )
 
     application.bot_data["conn"] = conn
     application.bot_data["parser"] = parser
     application.bot_data["transcriber"] = transcriber
+    application.bot_data["image_extractor"] = image_extractor
     application.bot_data["expiry_reminder_days"] = settings.expiry_reminder_days
 
     application.add_handler(
@@ -232,6 +448,10 @@ def build_application(settings: Settings) -> Application:
     )
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, handle_voice)
+    )
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(
+        CallbackQueryHandler(on_photo_decision, pattern="^img_")
     )
 
     # Daily expiry reminder job.

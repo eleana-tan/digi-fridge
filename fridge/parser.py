@@ -30,12 +30,20 @@ from .models import (
     QUERY_EXPIRING,
     QUERY_HAVE_ITEM,
     QUERY_LIST_ALL,
+    QUERY_BY_USER,
+    QUERY_WHO_HAS,
     ItemSpec,
     ParsedAction,
 )
 
 _VALID_ACTIONS = {ACTION_ADD, ACTION_REMOVE, ACTION_UPDATE, ACTION_QUERY, ACTION_UNKNOWN}
-_VALID_QUERIES = {QUERY_LIST_ALL, QUERY_EXPIRING, QUERY_HAVE_ITEM}
+_VALID_QUERIES = {
+    QUERY_LIST_ALL,
+    QUERY_EXPIRING,
+    QUERY_HAVE_ITEM,
+    QUERY_WHO_HAS,
+    QUERY_BY_USER,
+}
 
 # Very small keyword -> category map used by the rule-based parser and as a
 # reasonable default categoriser.
@@ -176,8 +184,8 @@ structured JSON action. Respond with ONLY a JSON object, no prose.
 Schema:
 {
   "action": "add" | "remove" | "update" | "query" | "unknown",
-  "query_type": "list_all" | "expiring_soon" | "have_item" | null,
-  "query_target": string | null,   // item name for have_item queries
+  "query_type": "list_all" | "expiring_soon" | "have_item" | "who_has" | "by_user" | null,
+  "query_target": string | null,   // item name for have_item/who_has; username for by_user
   "items": [
     {
       "item_name": string,          // singular, lowercase, no quantity words
@@ -200,6 +208,10 @@ Rules:
   * "what do I have" / "list" => query_type "list_all".
   * "what's expiring" / "about to go bad" => query_type "expiring_soon".
   * "do I have X" / "any X left" => query_type "have_item" with query_target = X.
+  * "who bought X" / "whose X is this" / "who has X" => query_type "who_has"
+    with query_target = X (group attribution: item -> buyers).
+  * "what did Alice buy" / "what has Bob added" => query_type "by_user"
+    with query_target = the username (no @).
 - Resolve relative dates ("in 3 days", "next Friday") against TODAY given below.
 - If you truly cannot tell, action "unknown" with empty items.
 """
@@ -343,10 +355,58 @@ class RuleBasedParser:
     # -- query detection ---------------------------------------------------
     def _try_query(self, text: str, lower: str) -> Optional[ParsedAction]:
         is_question = text.endswith("?")
+
+        # "who bought/has/owns X", "whose X (is this)" -> item attribution.
+        who_match = re.search(
+            r"(?:who\s+(?:bought|has|have|owns|added|got)|whose)\s+"
+            r"(?:is\s+the\s+|the\s+|some\s+|any\s+)?"
+            r"([a-z][a-z\s]*?)(?:\s+(?:is|are)\s+(?:this|these|that|those))?\??$",
+            lower,
+        )
+        if who_match:
+            target = " ".join(
+                w for w in who_match.group(1).strip().split() if w not in _STOPWORDS
+            )
+            if target:
+                return ParsedAction(
+                    action=ACTION_QUERY,
+                    query_type=QUERY_WHO_HAS,
+                    query_target=target,
+                )
+
+        # "what did Alice buy/add/get", "what has Bob bought"
+        by_user_match = re.search(
+            r"(?:what\s+(?:did|has|have)\s+@?([a-z0-9_]+)\s+"
+            r"(?:buy|bought|add|added|get|got|purchase|purchased)"
+            r"|what\s+(?:has|have)\s+@?([a-z0-9_]+)\s+(?:got|gotten))",
+            lower,
+        )
+        if by_user_match:
+            target = (by_user_match.group(1) or by_user_match.group(2) or "").strip()
+            if target:
+                return ParsedAction(
+                    action=ACTION_QUERY,
+                    query_type=QUERY_BY_USER,
+                    query_target=target,
+                )
+
         if any(k in lower for k in ("expiring", "expire", "going bad", "go bad", "about to go")):
             return ParsedAction(action=ACTION_QUERY, query_type=QUERY_EXPIRING)
 
-        if any(k in lower for k in ("what do i have", "what's in", "whats in", "list", "inventory", "show me", "what have i got")):
+        if any(
+            k in lower
+            for k in (
+                "what do i have",
+                "what do we have",
+                "what's in",
+                "whats in",
+                "list",
+                "inventory",
+                "show me",
+                "what have i got",
+                "what have we got",
+            )
+        ):
             return ParsedAction(action=ACTION_QUERY, query_type=QUERY_LIST_ALL)
 
         have_match = re.search(r"(?:do i have|any|is there|have i got|got any)\s+(?:some\s+|any\s+)?([a-z][a-z\s]*?)(?:\s+left)?\??$", lower)

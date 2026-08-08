@@ -23,7 +23,11 @@ class MigrationTests(DBTestCase):
         # Running again should not raise or duplicate.
         db.migrate(self.conn)
         rows = self.conn.execute("SELECT version FROM schema_migrations").fetchall()
-        self.assertEqual([r[0] for r in rows], [1])
+        self.assertEqual([r[0] for r in rows], [1, 2])
+
+    def test_scope_column_exists(self):
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(inventory)")}
+        self.assertIn("scope_key", cols)
 
     def test_tables_exist(self):
         names = {
@@ -115,11 +119,50 @@ class InventoryReadTests(DBTestCase):
         names = [i.item_name for i in soon]
         self.assertEqual(names, ["milk"])
 
-    def test_users_with_expiring(self):
+    def test_scopes_with_expiring(self):
         db.add_or_increment(self.conn, "u1", "milk", expires_on="2026-08-10")
         db.add_or_increment(self.conn, "u2", "eggs", expires_on="2026-08-30")
-        users = db.users_with_expiring(self.conn, within_days=2, today="2026-08-09")
-        self.assertEqual(users, ["u1"])
+        scopes = db.scopes_with_expiring(self.conn, within_days=2, today="2026-08-09")
+        self.assertEqual(scopes, ["u1"])
+
+
+class GroupScopeTests(DBTestCase):
+    def test_two_users_keep_separate_attributed_rows(self):
+        scope = "chat:123"
+        db.add_or_increment(self.conn, scope, "milk", 2, "carton", added_by="alice")
+        db.add_or_increment(self.conn, scope, "milk", 1, "carton", added_by="bob")
+        items = db.get_items(self.conn, scope)
+        self.assertEqual(len(items), 2)
+        by_user = {i.user_id: i.item_qty for i in items}
+        self.assertEqual(by_user, {"alice": 2, "bob": 1})
+
+    def test_same_user_increments_not_duplicates(self):
+        scope = "chat:123"
+        db.add_or_increment(self.conn, scope, "milk", 1, added_by="alice")
+        db.add_or_increment(self.conn, scope, "milk", 2, added_by="alice")
+        items = db.get_items(self.conn, scope)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].item_qty, 3)
+
+    def test_search_returns_all_contributors(self):
+        scope = "chat:123"
+        db.add_or_increment(self.conn, scope, "milk", 2, added_by="alice")
+        db.add_or_increment(self.conn, scope, "milk", 1, added_by="bob")
+        matches = db.search_items(self.conn, scope, "milk")
+        self.assertEqual({m.user_id for m in matches}, {"alice", "bob"})
+
+    def test_remove_prefers_callers_own_item(self):
+        scope = "chat:123"
+        db.add_or_increment(self.conn, scope, "milk", 2, added_by="alice")
+        db.add_or_increment(self.conn, scope, "milk", 1, added_by="bob")
+        status, item = db.remove_quantity(
+            self.conn, scope, "milk", remove_all=True, prefer_user="bob"
+        )
+        self.assertEqual(status, "deleted")
+        self.assertEqual(item.user_id, "bob")
+        remaining = db.get_items(self.conn, scope)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].user_id, "alice")
 
 
 class UserMappingTests(DBTestCase):
