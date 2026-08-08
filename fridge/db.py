@@ -441,6 +441,13 @@ def delete_item(conn: sqlite3.Connection, scope_key: str, item_name: str) -> boo
     return True
 
 
+def clear_scope(conn: sqlite3.Connection, scope_key: str) -> int:
+    """Delete every inventory row in a scope. Returns how many rows were removed."""
+    cur = conn.execute("DELETE FROM inventory WHERE scope_key = ?", (scope_key,))
+    conn.commit()
+    return cur.rowcount
+
+
 # ---------------------------------------------------------------------------
 # Action log
 # ---------------------------------------------------------------------------

@@ -316,12 +316,30 @@ for SSH (`ssh you@eleanatanrui.com`) and later HTTPS webhooks if you want them.
 7. **Stop the bot on your laptop** (`Ctrl+C`). Only one process may poll with
    the same token.
 
+### Private repo: set up a deploy key once (no more PATs)
+
+After the bot is installed under `/opt/digi-fridge`, create a **read-only
+SSH deploy key** on the VPS so updates never need a personal access token:
+
+```bash
+sudo bash /opt/digi-fridge/deploy/setup-deploy-key.sh
+```
+
+Copy the printed public key into GitHub → **digi-fridge → Settings → Deploy
+keys → Add deploy key** (leave “Allow write access” unchecked). Then test:
+
+```bash
+sudo -u digifridge bash -lc 'source /opt/digi-fridge/.git-ssh-env && git -C /opt/digi-fridge fetch origin'
+```
+
 ### Updating after you push to GitHub
 
 ```bash
-sudo bash /opt/digi-fridge/deploy/setup.sh
-sudo systemctl restart digi-fridge
+sudo bash /opt/digi-fridge/deploy/update.sh
 ```
+
+That pulls `main`, refreshes dependencies, and restarts the service. Your
+`.env` and SQLite DB are left alone.
 
 ### Useful commands
 

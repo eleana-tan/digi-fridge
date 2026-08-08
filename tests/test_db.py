@@ -164,6 +164,17 @@ class GroupScopeTests(DBTestCase):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0].user_id, "alice")
 
+    def test_clear_scope(self):
+        scope = "chat:123"
+        other = "chat:999"
+        db.add_or_increment(self.conn, scope, "milk", 1, added_by="alice")
+        db.add_or_increment(self.conn, scope, "eggs", 6, added_by="bob")
+        db.add_or_increment(self.conn, other, "bread", 1, added_by="carol")
+        removed = db.clear_scope(self.conn, scope)
+        self.assertEqual(removed, 2)
+        self.assertEqual(db.get_items(self.conn, scope), [])
+        self.assertEqual(len(db.get_items(self.conn, other)), 1)
+
 
 class UserMappingTests(DBTestCase):
     def test_remember_and_get_chat_id(self):

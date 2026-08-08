@@ -77,6 +77,7 @@ WELCOME = (
     "/expiring — what's going bad soon\n"
     "/who milk — who bought an item\n"
     "/by alice — what someone added\n"
+    "/clear — empty the whole fridge (asks to confirm)\n"
     "/cancel — discard a pending photo draft\n"
     "/help — this message\n\n"
     "You can also:\n"
@@ -97,6 +98,7 @@ BOT_COMMANDS = [
     BotCommand("expiring", "Show items expiring soon"),
     BotCommand("who", "Who bought an item — /who milk"),
     BotCommand("by", "What someone added — /by alice"),
+    BotCommand("clear", "Empty the whole fridge (asks to confirm)"),
     BotCommand("cancel", "Cancel a pending photo draft"),
 ]
 
@@ -210,6 +212,54 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Nothing pending to cancel.")
         return
     await update.message.reply_text("Okay, I discarded the photo draft.")
+
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask for confirmation, then wipe every item in this chat's fridge."""
+    scope_key, added_by, is_group = resolve_scope(update)
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    _remember_dm(conn, update, added_by)
+
+    count = len(db.get_items(conn, scope_key))
+    if count == 0:
+        await update.message.reply_text("The fridge is already empty.")
+        return
+
+    where = "this group's shared fridge" if is_group else "your fridge"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Yes, clear everything", callback_data="clear_confirm"
+                ),
+                InlineKeyboardButton("Cancel", callback_data="clear_cancel"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        f"Clear all {count} item(s) from {where}?\n"
+        "This cannot be undone.",
+        reply_markup=keyboard,
+    )
+
+
+async def on_clear_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Yes/Cancel under a /clear prompt."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "clear_cancel":
+        await query.edit_message_text("Okay, I left the fridge as-is.")
+        return
+
+    scope_key, added_by, is_group = resolve_scope(update)
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    removed = db.clear_scope(conn, scope_key)
+    db.log_action(conn, added_by, "/clear", f"CLEARED:{removed}")
+    where = "the group's fridge" if is_group else "your fridge"
+    await query.edit_message_text(
+        f"Cleared {removed} item(s) from {where}. It's empty now."
+    )
 
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -519,6 +569,7 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("expiring", cmd_expiring))
     application.add_handler(CommandHandler("who", cmd_who))
     application.add_handler(CommandHandler("by", cmd_by))
+    application.add_handler(CommandHandler("clear", cmd_clear))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
 
     conn = db.connect(settings.db_path)
@@ -569,6 +620,9 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(
         CallbackQueryHandler(on_photo_decision, pattern="^img_")
+    )
+    application.add_handler(
+        CallbackQueryHandler(on_clear_decision, pattern="^clear_")
     )
 
     # Daily expiry reminder job.
