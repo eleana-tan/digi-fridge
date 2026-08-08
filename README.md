@@ -22,6 +22,7 @@ parsing/logic without a live Telegram connection.
 | `fridge/parser.py` | Message → structured action (LLM **or** rule-based) | no | only LLM path |
 | `fridge/transcribe.py` | Voice audio → text (OpenAI) | no | only voice path |
 | `fridge/vision.py` | Grocery/receipt photo → proposed items (OpenAI) | no | only photo path |
+| `fridge/recipes.py` | Ingredients → recipe ideas + clickable links | no | only recipe path |
 | `fridge/actions.py` | Execute action against DB, build reply | no | no |
 | `fridge/reminders.py` | Find expiring items + notify | delivery only | no |
 | `fridge/bot.py` | Telegram wiring / entrypoint | **yes** | yes |
@@ -51,6 +52,13 @@ The blocking LLM/transcription/vision calls run in worker threads
 everyone else; all database access stays on the event-loop thread, keeping
 SQLite single-threaded and safe. (Schema migration `v2` adds the `scope_key`
 column and backfills existing rows to each owner's personal scope.)
+
+### Recipe inspiration
+
+Ask `what can I cook?` or `/recipe` to get meal ideas from the current fridge,
+or name ingredients: `/recipe eggs spinach` / `recipes with chicken and rice`.
+Each suggestion includes a clickable web link (a working Google recipe search,
+or a direct URL when the model is confident). Requires `OPENAI_API_KEY`.
 
 ### Photo logging (verify + edit before save)
 
@@ -255,6 +263,15 @@ Requires `OPENAI_API_KEY`. Send the bot a **photo** of a receipt or groceries:
 
 Offline: `python -m unittest tests.test_vision tests.test_pending -v`.
 
+### Step 9 — Recipe inspiration
+
+Requires `OPENAI_API_KEY`. With some items in the fridge:
+
+- `/recipe` or `what can I cook?` → ideas using inventory + clickable links
+- `/recipe eggs spinach` or `recipes with chicken and rice` → ideas for those
+
+Offline: `python -m unittest tests.test_recipes tests.test_parser -v`.
+
 ## Project layout
 
 ```
@@ -266,6 +283,7 @@ fridge/
   parser.py        LLMParser (injectable client) + RuleBasedParser
   transcribe.py    OpenAITranscriber (voice -> text)
   vision.py        OpenAIImageExtractor (photo -> proposed items)
+  recipes.py       recipe ideas + clickable search/direct links
   pending.py       draft edit/confirm helpers for photo proposals
   actions.py       execute ParsedAction -> reply text
   reminders.py     build_reminders (pure) + send_daily_reminders (Telegram)
@@ -356,6 +374,6 @@ you later switch to webhooks.
 ## Non-goals (this pass)
 
 Per-user inventories (DMs) and shared group fridges with per-item attribution
-are supported, along with voice input and photo/receipt logging. Still out of
-scope this pass: recipe suggestions, and any auth beyond the Telegram
-user/chat id. Photo extraction always asks you to confirm before saving.
+are supported, along with voice input, photo/receipt logging, and recipe
+inspiration. Still out of scope: any auth beyond the Telegram user/chat id.
+Photo extraction always asks you to confirm before saving.

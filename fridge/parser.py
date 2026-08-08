@@ -31,6 +31,7 @@ from .models import (
     QUERY_HAVE_ITEM,
     QUERY_LIST_ALL,
     QUERY_BY_USER,
+    QUERY_RECIPES,
     QUERY_WHO_HAS,
     ItemSpec,
     ParsedAction,
@@ -43,6 +44,7 @@ _VALID_QUERIES = {
     QUERY_HAVE_ITEM,
     QUERY_WHO_HAS,
     QUERY_BY_USER,
+    QUERY_RECIPES,
 }
 
 # Very small keyword -> category map used by the rule-based parser and as a
@@ -184,7 +186,7 @@ structured JSON action. Respond with ONLY a JSON object, no prose.
 Schema:
 {
   "action": "add" | "remove" | "update" | "query" | "unknown",
-  "query_type": "list_all" | "expiring_soon" | "have_item" | "who_has" | "by_user" | null,
+  "query_type": "list_all" | "expiring_soon" | "have_item" | "who_has" | "by_user" | "recipes" | null,
   "query_target": string | null,   // item name for have_item/who_has; username for by_user
   "items": [
     {
@@ -212,6 +214,9 @@ Rules:
     with query_target = X (group attribution: item -> buyers).
   * "what did Alice buy" / "what has Bob added" => query_type "by_user"
     with query_target = the username (no @).
+  * "what can I cook" / "recipe ideas" / "recipes with X and Y" => query_type
+    "recipes". If the user named ingredients, put them in items; if they mean
+    "based on my fridge", leave items empty.
 - Resolve relative dates ("in 3 days", "next Friday") against TODAY given below.
 - If you truly cannot tell, action "unknown" with empty items.
 """
@@ -390,6 +395,11 @@ class RuleBasedParser:
                     query_target=target,
                 )
 
+        # Recipe inspiration — before list/have so "what can I cook" isn't missed.
+        recipe = self._try_recipe_query(lower)
+        if recipe is not None:
+            return recipe
+
         if any(k in lower for k in ("expiring", "expire", "going bad", "go bad", "about to go")):
             return ParsedAction(action=ACTION_QUERY, query_type=QUERY_EXPIRING)
 
@@ -420,6 +430,37 @@ class RuleBasedParser:
                     query_target=target,
                 )
         return None
+
+    def _try_recipe_query(self, lower: str) -> Optional[ParsedAction]:
+        recipe_hints = (
+            "recipe",
+            "recipes",
+            "what can i cook",
+            "what can we cook",
+            "what should i cook",
+            "what should i make",
+            "what can i make",
+            "meal idea",
+            "meal ideas",
+            "cook with",
+            "make with",
+        )
+        if not any(h in lower for h in recipe_hints):
+            return None
+        # Optional ingredient list after "with" / "using" / "from".
+        m = re.search(
+            r"(?:with|using|from)\s+(.+?)(?:\?|$)",
+            lower,
+        )
+        items: list[ItemSpec] = []
+        if m:
+            items = self._extract_items(m.group(1))
+        return ParsedAction(
+            action=ACTION_QUERY,
+            query_type=QUERY_RECIPES,
+            items=items,
+            notes="rule-based: recipe inspiration",
+        )
 
     # -- item extraction ---------------------------------------------------
     def _extract_items(self, chunk: str, force_remove_all: bool = False) -> list[ItemSpec]:

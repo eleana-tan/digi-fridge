@@ -20,6 +20,7 @@ from fridge.models import (
     QUERY_HAVE_ITEM,
     QUERY_LIST_ALL,
     QUERY_BY_USER,
+    QUERY_RECIPES,
     QUERY_WHO_HAS,
     ParsedAction,
 )
@@ -296,6 +297,19 @@ class RuleBasedParserTests(unittest.TestCase):
         action = self.parser.parse("what do we have?")
         self.assertEqual(action.action, ACTION_QUERY)
         self.assertEqual(action.query_type, QUERY_LIST_ALL)
+
+    def test_query_recipes_from_fridge(self):
+        action = self.parser.parse("what can I cook?")
+        self.assertEqual(action.action, ACTION_QUERY)
+        self.assertEqual(action.query_type, QUERY_RECIPES)
+        self.assertEqual(action.items, [])
+
+    def test_query_recipes_with_ingredients(self):
+        action = self.parser.parse("recipes with eggs and spinach")
+        self.assertEqual(action.action, ACTION_QUERY)
+        self.assertEqual(action.query_type, QUERY_RECIPES)
+        names = sorted(i.item_name for i in action.items)
+        self.assertEqual(names, ["eggs", "spinach"])
 
     def test_bare_items_default_to_add(self):
         action = self.parser.parse("milk, bread, eggs")

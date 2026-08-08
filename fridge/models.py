@@ -22,6 +22,7 @@ QUERY_EXPIRING = "expiring_soon"
 QUERY_HAVE_ITEM = "have_item"
 QUERY_WHO_HAS = "who_has"  # "who bought the milk?" (item -> buyers)
 QUERY_BY_USER = "by_user"  # "what did Alice buy?" (user -> their items)
+QUERY_RECIPES = "recipes"  # "what can I cook?" / recipe inspiration
 
 
 @dataclass

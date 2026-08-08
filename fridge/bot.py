@@ -39,11 +39,13 @@ from .models import (
     QUERY_BY_USER,
     QUERY_EXPIRING,
     QUERY_LIST_ALL,
+    QUERY_RECIPES,
     QUERY_WHO_HAS,
     ItemSpec,
     ParsedAction,
 )
 from .parser import build_parser
+from .recipes import build_recipe_suggester, format_recipe_reply
 from .pending import (
     STATUS_CANCELLED,
     STATUS_CONFIRMED,
@@ -71,10 +73,12 @@ WELCOME = (
     '- "used the last of the cheese"\n'
     '- "what do I have?"\n'
     '- "what\'s expiring soon?"\n'
-    '- "do I have milk?"\n\n'
+    '- "do I have milk?"\n'
+    '- "what can I cook?" / "recipes with eggs and spinach"\n\n'
     "Slash commands (tap / in Telegram):\n"
     "/list — what's in the fridge\n"
     "/expiring — what's going bad soon\n"
+    "/recipe — meal ideas from your fridge (or /recipe eggs milk)\n"
     "/who milk — who bought an item\n"
     "/by alice — what someone added\n"
     "/clear — empty the whole fridge (asks to confirm)\n"
@@ -96,6 +100,7 @@ BOT_COMMANDS = [
     BotCommand("help", "Help and tips"),
     BotCommand("list", "Show what's in the fridge"),
     BotCommand("expiring", "Show items expiring soon"),
+    BotCommand("recipe", "Meal ideas from fridge or /recipe eggs milk"),
     BotCommand("who", "Who bought an item — /who milk"),
     BotCommand("by", "What someone added — /by alice"),
     BotCommand("clear", "Empty the whole fridge (asks to confirm)"),
@@ -299,10 +304,76 @@ async def _process_text(
         return
 
     db.log_action(conn, added_by, message_text, json.dumps(asdict(parsed)))
+
+    if parsed.action == ACTION_QUERY and parsed.query_type == QUERY_RECIPES:
+        await _reply_recipes(update, context, scope_key, parsed)
+        return
+
     reply = actions.execute(
         conn, scope_key, parsed, added_by=added_by, is_group=is_group
     )
     await update.message.reply_text(reply)
+
+
+async def _reply_recipes(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    scope_key: str,
+    parsed: ParsedAction,
+) -> None:
+    """Suggest recipes from named ingredients or the current fridge inventory."""
+    suggester = context.application.bot_data.get("recipe_suggester")
+    if suggester is None:
+        await update.message.reply_text(
+            "Recipe ideas need an OpenAI API key. Set OPENAI_API_KEY in .env."
+        )
+        return
+
+    ingredients = [spec.item_name for spec in parsed.items if spec.item_name]
+    if not ingredients:
+        conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+        ingredients = [item.item_name for item in db.get_items(conn, scope_key)]
+
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for name in ingredients:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(name)
+
+    if update.effective_chat:
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action="typing"
+        )
+    try:
+        recipes = await asyncio.to_thread(suggester.suggest, unique)
+    except Exception:  # noqa: BLE001
+        logger.exception("Recipe suggestion failed")
+        await update.message.reply_text(
+            "Sorry, I couldn't fetch recipe ideas just now. Try again in a moment."
+        )
+        return
+    await update.message.reply_text(
+        format_recipe_reply(recipes, unique),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/recipe — ideas from fridge; /recipe eggs milk — from listed ingredients."""
+    scope_key, added_by, _is_group = resolve_scope(update)
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    _remember_dm(conn, update, added_by)
+
+    items = [
+        ItemSpec(item_name=arg.strip().lower())
+        for arg in (context.args or [])
+        if arg.strip()
+    ]
+    parsed = ParsedAction(action=ACTION_QUERY, query_type=QUERY_RECIPES, items=items)
+    await _reply_recipes(update, context, scope_key, parsed)
 
 
 def _remember_dm(conn, update: Update, added_by: str) -> None:
@@ -567,6 +638,7 @@ def build_application(settings: Settings) -> Application:
     # Full mode: open the DB, build the parser, wire the reminder job.
     application.add_handler(CommandHandler("list", cmd_list))
     application.add_handler(CommandHandler("expiring", cmd_expiring))
+    application.add_handler(CommandHandler("recipe", cmd_recipe))
     application.add_handler(CommandHandler("who", cmd_who))
     application.add_handler(CommandHandler("by", cmd_by))
     application.add_handler(CommandHandler("clear", cmd_clear))
@@ -590,9 +662,14 @@ def build_application(settings: Settings) -> Application:
         openai_api_key=settings.openai_api_key,
         model=settings.openai_vision_model,
     )
+    recipe_suggester = build_recipe_suggester(
+        openai_api_key=settings.openai_api_key,
+        model=settings.openai_model,
+    )
     if settings.has_openai:
         logger.info(
-            "Using parser mode=%s (model=%s), voice (model=%s), vision (model=%s).",
+            "Using parser mode=%s (model=%s), voice (model=%s), vision (model=%s), "
+            "recipes enabled.",
             settings.parser_mode,
             settings.openai_model,
             settings.openai_transcribe_model,
@@ -601,14 +678,15 @@ def build_application(settings: Settings) -> Application:
     else:
         logger.warning(
             "OPENAI_API_KEY not set - using the offline rule-based parser; "
-            "voice and photo logging are disabled. Set OPENAI_API_KEY in .env "
-            "for full natural-language understanding, voice, and image support."
+            "voice, photo, and recipe ideas are disabled. Set OPENAI_API_KEY in "
+            ".env for full natural-language understanding and those features."
         )
 
     application.bot_data["conn"] = conn
     application.bot_data["parser"] = parser
     application.bot_data["transcriber"] = transcriber
     application.bot_data["image_extractor"] = image_extractor
+    application.bot_data["recipe_suggester"] = recipe_suggester
     application.bot_data["expiry_reminder_days"] = settings.expiry_reminder_days
 
     application.add_handler(
