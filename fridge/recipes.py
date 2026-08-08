@@ -25,7 +25,10 @@ Respond with ONLY a JSON object:
       "summary": string,              // 1 short sentence
       "uses": [string, ...],          // ingredients from the provided list
       "missing": [string, ...],       // common pantry extras they may need
-      "calories_per_portion": number | null,  // rough kcal estimate for 1 serving
+      "calories_per_portion": number | null,  // rough kcal for 1 serving
+      "protein_g": number | null,     // rough grams protein per serving
+      "carbs_g": number | null,       // rough grams carbs per serving
+      "fat_g": number | null,         // rough grams fat per serving
       "search_query": string,         // good web search for this recipe
       "url": string | null            // direct recipe URL only if you are
                                       // highly confident it is a real page
@@ -37,9 +40,10 @@ Respond with ONLY a JSON object:
 Rules:
 - Suggest 3 recipes max, preferring ones that use many of the given ingredients.
 - Prefer everyday dishes; mention if something is nearly out / stretchable.
-- calories_per_portion: best-effort estimate in kcal for one adult serving
-  (typical home portion). Round to a sensible whole number (e.g. 350, 520).
-  If you truly cannot estimate, use null — do not invent extremes.
+- Nutrition (calories_per_portion, protein_g, carbs_g, fat_g): best-effort
+  estimates for one adult home serving. Round to whole numbers. Macros should
+  be roughly consistent with calories (protein/carbs ≈ 4 kcal/g, fat ≈ 9).
+  If you cannot estimate a field, use null — do not invent extremes.
 - search_query should be specific, e.g. "easy chicken stir fry recipe".
 - Do NOT invent URLs. If unsure, set url to null (a search link will be added).
 - If the ingredient list is empty, return {"recipes": []}.
@@ -53,6 +57,9 @@ class RecipeIdea:
     uses: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
     calories_per_portion: Optional[int] = None  # rough kcal / serving
+    protein_g: Optional[int] = None
+    carbs_g: Optional[int] = None
+    fat_g: Optional[int] = None
     url: str = ""  # always a clickable http(s) link after normalisation
 
 
@@ -71,18 +78,48 @@ def _looks_like_http_url(value: str) -> bool:
     return bool(re.match(r"^https?://[^\s]+$", value.strip(), re.IGNORECASE))
 
 
-def _coerce_calories(value: Any) -> Optional[int]:
-    """Parse a calorie estimate; drop nonsense values."""
+def _coerce_bounded_int(
+    value: Any, *, lo: int, hi: int
+) -> Optional[int]:
+    """Parse an int estimate; drop values outside ``lo``..``hi``."""
     if value is None or value == "":
         return None
     try:
-        kcal = int(round(float(value)))
+        n = int(round(float(value)))
     except (TypeError, ValueError):
         return None
-    # Sanity bounds for a single adult portion.
-    if kcal < 50 or kcal > 2500:
+    if n < lo or n > hi:
         return None
-    return kcal
+    return n
+
+
+def _coerce_calories(value: Any) -> Optional[int]:
+    """Parse a calorie estimate; drop nonsense values."""
+    return _coerce_bounded_int(value, lo=50, hi=2500)
+
+
+def _coerce_macro_g(value: Any) -> Optional[int]:
+    """Parse a macro gram estimate for one portion."""
+    return _coerce_bounded_int(value, lo=0, hi=300)
+
+
+def _format_nutrition_line(recipe: RecipeIdea) -> Optional[str]:
+    """One-line kcal + macros, or None if nothing useful is present."""
+    bits: list[str] = []
+    if recipe.calories_per_portion is not None:
+        bits.append(f"~{recipe.calories_per_portion} kcal")
+    macros: list[str] = []
+    if recipe.protein_g is not None:
+        macros.append(f"P {recipe.protein_g}g")
+    if recipe.carbs_g is not None:
+        macros.append(f"C {recipe.carbs_g}g")
+    if recipe.fat_g is not None:
+        macros.append(f"F {recipe.fat_g}g")
+    if macros:
+        bits.append(" · ".join(macros))
+    if not bits:
+        return None
+    return " / ".join(bits) + " per portion (estimate)"
 
 
 def recipes_from_dict(data: dict[str, Any], *, max_recipes: int = 3) -> list[RecipeIdea]:
@@ -119,6 +156,9 @@ def recipes_from_dict(data: dict[str, Any], *, max_recipes: int = 3) -> list[Rec
                 uses=uses,
                 missing=missing,
                 calories_per_portion=calories,
+                protein_g=_coerce_macro_g(entry.get("protein_g")),
+                carbs_g=_coerce_macro_g(entry.get("carbs_g")),
+                fat_g=_coerce_macro_g(entry.get("fat_g")),
                 url=url,
             )
         )
@@ -147,10 +187,9 @@ def format_recipe_reply(
         lines = [f"{i}. {r.title}"]
         if r.summary:
             lines.append(r.summary)
-        if r.calories_per_portion is not None:
-            lines.append(
-                f"~{r.calories_per_portion} kcal per portion (estimate)"
-            )
+        nutrition = _format_nutrition_line(r)
+        if nutrition:
+            lines.append(nutrition)
         if r.uses:
             lines.append("Uses: " + ", ".join(r.uses))
         if r.missing:
@@ -159,7 +198,9 @@ def format_recipe_reply(
         blocks.append("\n".join(lines))
         blocks.append("")
     # Disclaimer once at the end — estimates, not lab values.
-    blocks.append("Calorie figures are rough estimates, not exact nutrition facts.")
+    blocks.append(
+        "Calorie/macro figures are rough estimates, not exact nutrition facts."
+    )
     return "\n".join(blocks).strip()
 
 

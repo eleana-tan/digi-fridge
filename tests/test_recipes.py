@@ -23,6 +23,9 @@ class RecipesFromDictTests(unittest.TestCase):
                         "uses": ["eggs", "spinach"],
                         "missing": ["soy sauce"],
                         "calories_per_portion": 420,
+                        "protein_g": 18,
+                        "carbs_g": 35,
+                        "fat_g": 22,
                         "search_query": "easy veggie stir fry",
                         "url": None,
                     }
@@ -32,6 +35,9 @@ class RecipesFromDictTests(unittest.TestCase):
         self.assertEqual(len(ideas), 1)
         self.assertEqual(ideas[0].title, "Veggie Stir Fry")
         self.assertEqual(ideas[0].calories_per_portion, 420)
+        self.assertEqual(ideas[0].protein_g, 18)
+        self.assertEqual(ideas[0].carbs_g, 35)
+        self.assertEqual(ideas[0].fat_g, 22)
         self.assertIn("google.com/search", ideas[0].url)
         self.assertIn("stir", ideas[0].url.lower())
 
@@ -99,6 +105,9 @@ class FormatReplyTests(unittest.TestCase):
                         "uses": ["pasta", "cheese"],
                         "missing": ["garlic"],
                         "calories_per_portion": 550,
+                        "protein_g": 20,
+                        "carbs_g": 70,
+                        "fat_g": 18,
                         "search_query": "simple cheese pasta",
                     }
                 ]
@@ -107,7 +116,10 @@ class FormatReplyTests(unittest.TestCase):
         text = format_recipe_reply(ideas, ["pasta", "cheese"])
         self.assertIn("Based on: pasta, cheese", text)
         self.assertIn("Pasta", text)
-        self.assertIn("~550 kcal per portion", text)
+        self.assertIn("~550 kcal", text)
+        self.assertIn("P 20g", text)
+        self.assertIn("C 70g", text)
+        self.assertIn("F 18g", text)
         self.assertIn("Recipe: http", text)
         self.assertIn("garlic", text)
         self.assertIn("rough estimates", text)
