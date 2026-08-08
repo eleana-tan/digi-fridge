@@ -44,6 +44,10 @@ from .models import (
     ItemSpec,
     ParsedAction,
 )
+from .group_gate import (
+    should_handle_in_group,
+    strip_bot_mention,
+)
 from .parser import build_parser
 from .recipes import build_recipe_suggester, format_recipe_reply
 from .pending import (
@@ -91,6 +95,8 @@ WELCOME = (
     "In a group chat I keep one shared fridge and remember who added what. "
     'Ask "who bought the milk?" or "what did alice buy?" for attribution '
     "(ordinary lists don't show buyers).\n"
+    "In groups I ignore normal chat — @mention me, reply to me, use a /command, "
+    'or say something fridge-related like "bought milk".\n'
     "I'll also remind you when things are about to expire."
 )
 
@@ -133,6 +139,29 @@ def resolve_scope(update: Update) -> tuple[str, str, bool]:
     if chat and chat.type in ("group", "supergroup"):
         return f"chat:{chat.id}", added_by, True
     return f"user:{added_by}", added_by, False
+
+
+def _is_group_chat(update: Update) -> bool:
+    chat = update.effective_chat
+    return bool(chat and chat.type in ("group", "supergroup"))
+
+
+def _should_process_group_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    text: str = "",
+    allow_fridge_intent: bool = True,
+) -> bool:
+    """In groups, ignore chatter unless the bot is addressed or it's fridge-like."""
+    return should_handle_in_group(
+        is_group=_is_group_chat(update),
+        message=update.message,
+        bot_id=context.bot.id,
+        bot_username=context.bot.username or "",
+        text=text,
+        allow_fridge_intent=allow_fridge_intent,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -391,11 +420,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         handled = await _try_pending_photo_text(update, context, text)
         if handled:
             return
+    if not _should_process_group_message(update, context, text=text):
+        return  # group chatter — stay silent
+    # "@FridgeBot bought milk" -> parse "bought milk"
+    text = strip_bot_mention(text, context.bot.username or "")
+    if not text:
+        return
     await _process_text(update, context, text)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle a voice note / audio: download -> transcribe -> text pipeline."""
+    # In groups, only react to voice when @mentioned or replying to the bot.
+    if not _should_process_group_message(
+        update, context, text="", allow_fridge_intent=False
+    ):
+        return
+
     user_id = resolve_user_id(update)
     conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
     transcriber = context.application.bot_data.get("transcriber")
@@ -539,6 +580,13 @@ async def _try_pending_photo_text(
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """A photo (receipt / groceries): extract items and ask to confirm/edit."""
+    caption = update.message.caption or ""
+    # In groups: need @mention/reply, or a fridge-like caption (e.g. "add these").
+    if not _should_process_group_message(
+        update, context, text=caption, allow_fridge_intent=bool(caption)
+    ):
+        return
+
     conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
     extractor = context.application.bot_data.get("image_extractor")
     added_by = resolve_user_id(update)

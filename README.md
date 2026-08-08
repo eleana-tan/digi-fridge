@@ -40,12 +40,17 @@ The parser has two implementations behind one interface:
 Inventory lives in a **scope**:
 
 - In a **direct message**, the scope is the user's personal fridge
-  (`user:<handle>`) — private, isolated per person.
+  (`user:<handle>`) — private, isolated per person. The bot answers every message.
 - In a **group chat**, the scope is one **shared fridge** for the group
   (`chat:<id>`), and every item records **who added it** (`user_id`). Ordinary
   list / "do we have milk?" / expiring replies do **not** show buyers. Ask
   explicitly: `who bought the milk?`, `whose eggs are these?`, or
   `what did alice buy?`.
+
+  In groups the bot **stays quiet on normal chat**. It only replies when you
+  @mention it, reply to it, use a `/command`, or say something clearly
+  fridge-related (`bought milk`, `what do we have?`, etc.). Voice notes in
+  groups need an @mention or reply; photos need that or a fridge-like caption.
 
 The blocking LLM/transcription/vision calls run in worker threads
 (`asyncio.to_thread`), so one user's slow request never stalls the bot for
