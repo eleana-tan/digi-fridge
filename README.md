@@ -50,7 +50,8 @@ Inventory lives in a **scope**:
   In groups the bot **stays quiet on normal chat**. It only replies when you
   @mention it, reply to it, use a `/command`, or say something clearly
   fridge-related (`bought milk`, `what do we have?`, etc.). Voice notes in
-  groups need an @mention or reply; photos need that or a fridge-like caption.
+  groups need an @mention or reply. **Photos always mean inventory update**
+  (no caption required) — you'll still confirm before anything is saved.
 
 The blocking LLM/transcription/vision calls run in worker threads
 (`asyncio.to_thread`), so one user's slow request never stalls the bot for

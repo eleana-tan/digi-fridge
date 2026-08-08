@@ -96,7 +96,8 @@ WELCOME = (
     'Ask "who bought the milk?" or "what did alice buy?" for attribution '
     "(ordinary lists don't show buyers).\n"
     "In groups I ignore normal chat — @mention me, reply to me, use a /command, "
-    'or say something fridge-related like "bought milk".\n'
+    'or say something fridge-related like "bought milk". '
+    "A photo always means \"add these groceries\" (you'll confirm first).\n"
     "I'll also remind you when things are about to expire."
 )
 
@@ -578,15 +579,32 @@ async def _try_pending_photo_text(
     return True
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """A photo (receipt / groceries): extract items and ask to confirm/edit."""
-    caption = update.message.caption or ""
-    # In groups: need @mention/reply, or a fridge-like caption (e.g. "add these").
-    if not _should_process_group_message(
-        update, context, text=caption, allow_fridge_intent=bool(caption)
-    ):
-        return
+def _image_mime_from_message(message) -> str:
+    doc = getattr(message, "document", None)
+    if doc and getattr(doc, "mime_type", None):
+        return doc.mime_type
+    return "image/jpeg"
 
+
+async def _download_image_bytes(message) -> bytes | None:
+    """Get image bytes from a compressed photo or an image document upload."""
+    if message.photo:
+        # Last PhotoSize is the highest resolution.
+        tg_file = await message.photo[-1].get_file()
+        return bytes(await tg_file.download_as_bytearray())
+    doc = message.document
+    if doc and (doc.mime_type or "").startswith("image/"):
+        tg_file = await doc.get_file()
+        return bytes(await tg_file.download_as_bytearray())
+    return None
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """An image always means: propose inventory items from the photo (then confirm).
+
+    No caption or @mention required — uploading a picture is the intent. Works in
+    DMs and groups (compressed photos and image file uploads).
+    """
     conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
     extractor = context.application.bot_data.get("image_extractor")
     added_by = resolve_user_id(update)
@@ -598,17 +616,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    if not update.message.photo:
-        return
-
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action="typing"
     )
     try:
-        # The last PhotoSize is the highest resolution.
-        tg_file = await update.message.photo[-1].get_file()
-        image_bytes = bytes(await tg_file.download_as_bytearray())
-        items = await asyncio.to_thread(extractor.extract, image_bytes, "image/jpeg")
+        image_bytes = await _download_image_bytes(update.message)
+        if not image_bytes:
+            return
+        mime = _image_mime_from_message(update.message)
+        items = await asyncio.to_thread(extractor.extract, image_bytes, mime)
     except Exception:  # noqa: BLE001 - never crash the handler
         logger.exception("Image extraction failed")
         db.log_action(conn, added_by, "<photo>", "VISION_ERROR")
@@ -743,7 +759,10 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, handle_voice)
     )
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    # Any image upload = inventory extract (photo bubble or image file).
+    application.add_handler(
+        MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo)
+    )
     application.add_handler(
         CallbackQueryHandler(on_photo_decision, pattern="^img_")
     )
