@@ -13,7 +13,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
-from .models import InventoryItem
+from .models import InventoryItem, SavedRecipe
 
 # ---------------------------------------------------------------------------
 # Migrations
@@ -72,6 +72,25 @@ _MIGRATIONS: list[tuple[int, str]] = [
             ON inventory (scope_key);
         CREATE INDEX IF NOT EXISTS idx_inventory_scope_name
             ON inventory (scope_key, item_name);
+        """,
+    ),
+    (
+        3,
+        """
+        CREATE TABLE IF NOT EXISTS saved_recipes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_key   TEXT NOT NULL,
+            added_by    TEXT NOT NULL,
+            url         TEXT NOT NULL,
+            title       TEXT NOT NULL,
+            keywords    TEXT NOT NULL DEFAULT '',
+            created_ts  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_saved_recipes_scope
+            ON saved_recipes (scope_key);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_recipes_scope_url
+            ON saved_recipes (scope_key, url);
         """,
     ),
 ]
@@ -446,6 +465,132 @@ def clear_scope(conn: sqlite3.Connection, scope_key: str) -> int:
     cur = conn.execute("DELETE FROM inventory WHERE scope_key = ?", (scope_key,))
     conn.commit()
     return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Saved recipes (Instagram reels, etc.)
+# ---------------------------------------------------------------------------
+def _row_to_saved_recipe(row: sqlite3.Row) -> SavedRecipe:
+    raw = (row["keywords"] or "").strip()
+    keywords = [k for k in raw.split(",") if k] if raw else []
+    return SavedRecipe(
+        id=row["id"],
+        scope_key=row["scope_key"],
+        added_by=row["added_by"],
+        url=row["url"],
+        title=row["title"],
+        keywords=keywords,
+        created_ts=row["created_ts"],
+    )
+
+
+def list_saved_recipes(conn: sqlite3.Connection, scope_key: str) -> list[SavedRecipe]:
+    rows = conn.execute(
+        """
+        SELECT * FROM saved_recipes
+        WHERE scope_key = ?
+        ORDER BY id DESC
+        """,
+        (scope_key,),
+    ).fetchall()
+    return [_row_to_saved_recipe(r) for r in rows]
+
+
+def get_saved_recipe(
+    conn: sqlite3.Connection, scope_key: str, recipe_id: int
+) -> Optional[SavedRecipe]:
+    row = conn.execute(
+        """
+        SELECT * FROM saved_recipes
+        WHERE scope_key = ? AND id = ?
+        """,
+        (scope_key, recipe_id),
+    ).fetchone()
+    return _row_to_saved_recipe(row) if row else None
+
+
+def find_saved_recipe_by_url(
+    conn: sqlite3.Connection, scope_key: str, url: str
+) -> Optional[SavedRecipe]:
+    row = conn.execute(
+        """
+        SELECT * FROM saved_recipes
+        WHERE scope_key = ? AND url = ?
+        """,
+        (scope_key, url),
+    ).fetchone()
+    return _row_to_saved_recipe(row) if row else None
+
+
+def add_saved_recipe(
+    conn: sqlite3.Connection,
+    scope_key: str,
+    added_by: str,
+    url: str,
+    title: str,
+    keywords: list[str] | None = None,
+) -> tuple[SavedRecipe, bool]:
+    """Insert a saved recipe. Returns ``(recipe, created)``.
+
+    If the URL already exists in this scope, updates keywords/title when provided
+    and returns ``created=False``.
+    """
+    keywords = [k.strip().lower() for k in (keywords or []) if k and k.strip()]
+    # Dedupe keywords, preserve order.
+    seen: set[str] = set()
+    clean_kw: list[str] = []
+    for k in keywords:
+        if k not in seen:
+            seen.add(k)
+            clean_kw.append(k)
+    kw_text = ",".join(clean_kw)
+    title = (title or "Saved recipe").strip() or "Saved recipe"
+    url = url.strip()
+
+    existing = find_saved_recipe_by_url(conn, scope_key, url)
+    if existing is not None:
+        # Merge keywords; keep newer title if it isn't the generic default.
+        merged = list(existing.keywords)
+        for k in clean_kw:
+            if k not in merged:
+                merged.append(k)
+        new_title = title if title != "Saved recipe" else existing.title
+        conn.execute(
+            """
+            UPDATE saved_recipes
+            SET title = ?, keywords = ?
+            WHERE id = ?
+            """,
+            (new_title, ",".join(merged), existing.id),
+        )
+        conn.commit()
+        updated = get_saved_recipe(conn, scope_key, existing.id)
+        assert updated is not None
+        return updated, False
+
+    cur = conn.execute(
+        """
+        INSERT INTO saved_recipes
+            (scope_key, added_by, url, title, keywords, created_ts)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (scope_key, added_by, url, title, kw_text, utcnow_iso()),
+    )
+    conn.commit()
+    recipe = get_saved_recipe(conn, scope_key, int(cur.lastrowid))
+    assert recipe is not None
+    return recipe, True
+
+
+def delete_saved_recipe(
+    conn: sqlite3.Connection, scope_key: str, recipe_id: int
+) -> bool:
+    cur = conn.execute(
+        "DELETE FROM saved_recipes WHERE scope_key = ? AND id = ?",
+        (scope_key, recipe_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

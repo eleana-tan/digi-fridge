@@ -55,7 +55,16 @@ from .parser import build_parser
 from .recipes import (
     build_recipe_suggester,
     format_recipe_reply,
-    split_recipe_command_args,
+)
+from .saved_recipes import (
+    PENDING_RECIPE_ADD_PROMPT,
+    format_save_confirmation,
+    format_saved_list,
+    format_saved_matches_section,
+    match_saved_recipes,
+    parse_recipe_add_args,
+    parse_recipe_add_message,
+    title_from_recipe_url,
 )
 from .pending import (
     STATUS_CANCELLED,
@@ -89,16 +98,22 @@ WELCOME = (
     "Slash commands (tap / in Telegram):\n"
     "/list — what's in the fridge\n"
     "/expiring — what's going bad soon\n"
-    "/recipe — meal ideas from your fridge (or /recipe eggs milk)\n"
+    "/recipe — meal ideas from your fridge + saved reels\n"
+    "/recipe korean — filter by keyword/style (matches your saves too)\n"
+    "/recipe_add — save an Instagram reel (+ optional keywords)\n"
+    "/reels — list saved recipe links\n"
+    "/recipe_remove 12 — remove a saved recipe by id\n"
     "/who milk — who bought an item\n"
     "/by alice — what someone added\n"
     "/clear — empty the whole fridge (asks to confirm)\n"
-    "/cancel — discard a pending photo draft\n"
+    "/cancel — discard a pending photo draft or recipe-add\n"
     "/help — this message\n\n"
     "You can also:\n"
     "- send a voice message and I'll transcribe it\n"
     "- send a photo of a receipt or groceries — I'll propose items; confirm, "
-    "cancel, or edit (e.g. remove 2 / change 1 to 3 eggs) before anything is saved\n\n"
+    "cancel, or edit (e.g. remove 2 / change 1 to 3 eggs) before anything is saved\n"
+    "- save Instagram recipe reels one-by-one with /recipe_add and tag them "
+    "(e.g. /recipe_add <url> korean spicy) so /recipe korean can find them\n\n"
     "In a group chat I keep one shared fridge and remember who added what. "
     'Ask "who bought the milk?" or "what did alice buy?" for attribution '
     "(ordinary lists don't show buyers).\n"
@@ -114,11 +129,14 @@ BOT_COMMANDS = [
     BotCommand("help", "Help and tips"),
     BotCommand("list", "Show what's in the fridge"),
     BotCommand("expiring", "Show items expiring soon"),
-    BotCommand("recipe", "Meal ideas from fridge or /recipe eggs milk"),
+    BotCommand("recipe", "Ideas from fridge/saves — /recipe korean"),
+    BotCommand("recipe_add", "Save Instagram reel + keywords"),
+    BotCommand("reels", "List saved recipe reels"),
+    BotCommand("recipe_remove", "Remove saved recipe — /recipe_remove 12"),
     BotCommand("who", "Who bought an item — /who milk"),
     BotCommand("by", "What someone added — /by alice"),
     BotCommand("clear", "Empty the whole fridge (asks to confirm)"),
-    BotCommand("cancel", "Cancel a pending photo draft"),
+    BotCommand("cancel", "Cancel pending photo draft or recipe-add"),
 ]
 
 
@@ -356,11 +374,18 @@ async def cmd_by(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Discard a pending photo draft, if any."""
-    if context.user_data.pop("pending_photo_items", None) is None:
+    """Discard a pending photo draft or recipe-add wait, if any."""
+    cleared = []
+    if context.user_data.pop("pending_photo_items", None) is not None:
+        cleared.append("photo draft")
+    if context.user_data.pop("pending_recipe_add", None) is not None:
+        cleared.append("recipe-add")
+    if not cleared:
         await update.message.reply_text("Nothing pending to cancel.")
         return
-    await update.message.reply_text("Okay, I discarded the photo draft.")
+    await update.message.reply_text(
+        "Okay, I cancelled the pending " + " and ".join(cleared) + "."
+    )
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -468,22 +493,17 @@ async def _reply_recipes(
     *,
     progress: ProgressReply,
 ) -> None:
-    """Suggest recipes from named ingredients or the current fridge inventory.
+    """Suggest recipes from fridge inventory, keywords, and saved Instagram reels.
 
     ``progress`` comes from the caller's ``typing_while`` so typing/placeholder
     stay active through the slow suggestion call.
     """
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
     suggester = context.application.bot_data.get("recipe_suggester")
-    if suggester is None:
-        await progress.send(
-            "Recipe ideas need an OpenAI API key. Set OPENAI_API_KEY in .env."
-        )
-        return
 
     request = (parsed.notes or "").strip()
     ingredients = [spec.item_name for spec in parsed.items if spec.item_name]
     if not ingredients:
-        conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
         ingredients = [item.item_name for item in db.get_items(conn, scope_key)]
 
     # Dedupe while preserving order.
@@ -495,34 +515,54 @@ async def _reply_recipes(
             seen.add(key)
             unique.append(name)
 
-    try:
-        recipes = await asyncio.to_thread(
-            suggester.suggest, unique, request=request
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("Recipe suggestion failed")
+    saved_all = db.list_saved_recipes(conn, scope_key)
+    matched = match_saved_recipes(
+        saved_all, query=request, ingredients=unique, limit=3
+    )
+    saved_section = format_saved_matches_section(matched)
+
+    recipes = []
+    if suggester is not None and (unique or request):
+        try:
+            recipes = await asyncio.to_thread(
+                suggester.suggest, unique, request=request
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Recipe suggestion failed")
+            if not saved_section:
+                await progress.send(
+                    "Sorry, I couldn't fetch recipe ideas just now. "
+                    "Try again in a moment."
+                )
+                return
+    elif suggester is None and not saved_section:
         await progress.send(
-            "Sorry, I couldn't fetch recipe ideas just now. Try again in a moment."
+            "Recipe ideas need an OpenAI API key (or save Instagram reels with "
+            "/recipe_add). Set OPENAI_API_KEY in .env."
         )
         return
+
     await progress.send(
-        format_recipe_reply(recipes, unique, request=request),
+        format_recipe_reply(
+            recipes, unique, request=request, saved_section=saved_section
+        ),
         disable_web_page_preview=True,
     )
 
 
 async def cmd_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/recipe — fridge ideas; /recipe eggs milk — ingredients; /recipe korean — style."""
+    """/recipe — fridge + saves; /recipe korean — keyword/style filter."""
     scope_key, added_by, _is_group = resolve_scope(update)
     conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
     _remember_dm(conn, update, added_by)
 
-    ingredient_names, request = split_recipe_command_args(context.args or [])
-    items = [ItemSpec(item_name=name) for name in ingredient_names]
+    # Slash args are keywords/style (custom tags from /recipe_add), not grocery
+    # names — ingredients always come from the fridge. Use NL for "recipes with X".
+    request = " ".join(context.args or []).strip()
     parsed = ParsedAction(
         action=ACTION_QUERY,
         query_type=QUERY_RECIPES,
-        items=items,
+        items=[],
         notes=request or None,
     )
     chat_id, message, thread_id = _chat_target(update)
@@ -530,6 +570,113 @@ async def cmd_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         context, chat_id, message=message, message_thread_id=thread_id
     ) as progress:
         await _reply_recipes(update, context, scope_key, parsed, progress=progress)
+
+
+async def _save_recipe_from_parts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    keywords: list[str],
+) -> None:
+    scope_key, added_by, _is_group = resolve_scope(update)
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    _remember_dm(conn, update, added_by)
+    title = title_from_recipe_url(url)
+    recipe, created = db.add_saved_recipe(
+        conn, scope_key, added_by, url, title, keywords
+    )
+    db.log_action(
+        conn,
+        added_by,
+        url,
+        f"SAVED_RECIPE:{recipe.id}:{'new' if created else 'update'}",
+    )
+    await update.message.reply_text(
+        format_save_confirmation(recipe, created=created),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_recipe_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/recipe_add <url> [keywords…] — or /recipe_add then paste the link next."""
+    args = list(context.args or [])
+    if not args:
+        context.user_data["pending_recipe_add"] = True
+        await update.message.reply_text(PENDING_RECIPE_ADD_PROMPT)
+        return
+
+    url, keywords = parse_recipe_add_args(args)
+    if not url:
+        await update.message.reply_text(
+            "I need a recipe link (Instagram reel or any website URL).\n"
+            "Example: /recipe_add https://www.instagram.com/reel/XXXX/ korean spicy"
+        )
+        return
+
+    context.user_data.pop("pending_recipe_add", None)
+    await _save_recipe_from_parts(update, context, url, keywords)
+
+
+async def cmd_reels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reels — list saved recipe links for this fridge scope."""
+    scope_key, added_by, _is_group = resolve_scope(update)
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    _remember_dm(conn, update, added_by)
+    recipes = db.list_saved_recipes(conn, scope_key)
+    await update.message.reply_text(
+        format_saved_list(recipes),
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_recipe_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/recipe_remove <id> — delete a saved recipe."""
+    scope_key, added_by, _is_group = resolve_scope(update)
+    conn: "db.sqlite3.Connection" = context.application.bot_data["conn"]
+    _remember_dm(conn, update, added_by)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /recipe_remove <id>\n"
+            "See ids with /reels."
+        )
+        return
+    raw = context.args[0].lstrip("#")
+    try:
+        recipe_id = int(raw)
+    except ValueError:
+        await update.message.reply_text(
+            "That doesn't look like a recipe id. Try /reels, then "
+            "/recipe_remove 12"
+        )
+        return
+
+    existing = db.get_saved_recipe(conn, scope_key, recipe_id)
+    if existing is None or not db.delete_saved_recipe(conn, scope_key, recipe_id):
+        await update.message.reply_text(
+            f"No saved recipe #{recipe_id} in this fridge. Check /reels."
+        )
+        return
+    db.log_action(conn, added_by, f"/recipe_remove {recipe_id}", "REMOVED_RECIPE")
+    await update.message.reply_text(
+        f"Removed #{recipe_id} ({existing.title}).",
+        disable_web_page_preview=True,
+    )
+
+
+async def _try_pending_recipe_add(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> bool:
+    """Handle the follow-up message after bare ``/recipe_add``."""
+    if not context.user_data.get("pending_recipe_add"):
+        return False
+    url, keywords = parse_recipe_add_message(text)
+    if not url:
+        await update.message.reply_text(PENDING_RECIPE_ADD_PROMPT)
+        return True
+    context.user_data.pop("pending_recipe_add", None)
+    await _save_recipe_from_parts(update, context, url, keywords)
+    return True
 
 
 def _remember_dm(conn, update: Update, added_by: str) -> None:
@@ -540,9 +687,14 @@ def _remember_dm(conn, update: Update, added_by: str) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle a typed text message (or a pending photo-draft edit)."""
+    """Handle a typed text message (or a pending photo-draft / recipe-add)."""
     text = update.message.text or ""
-    # If a photo draft is waiting, try to treat the text as an edit/confirm first.
+    # Pending flows first — even in groups, so a follow-up paste after /recipe_add
+    # isn't dropped by the chatter gate.
+    if context.user_data.get("pending_recipe_add"):
+        handled = await _try_pending_recipe_add(update, context, text)
+        if handled:
+            return
     if context.user_data.get("pending_photo_items") is not None:
         handled = await _try_pending_photo_text(update, context, text)
         if handled:
@@ -832,6 +984,9 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("list", cmd_list))
     application.add_handler(CommandHandler("expiring", cmd_expiring))
     application.add_handler(CommandHandler("recipe", cmd_recipe))
+    application.add_handler(CommandHandler("recipe_add", cmd_recipe_add))
+    application.add_handler(CommandHandler("reels", cmd_reels))
+    application.add_handler(CommandHandler("recipe_remove", cmd_recipe_remove))
     application.add_handler(CommandHandler("who", cmd_who))
     application.add_handler(CommandHandler("by", cmd_by))
     application.add_handler(CommandHandler("clear", cmd_clear))

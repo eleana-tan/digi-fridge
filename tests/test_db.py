@@ -23,7 +23,7 @@ class MigrationTests(DBTestCase):
         # Running again should not raise or duplicate.
         db.migrate(self.conn)
         rows = self.conn.execute("SELECT version FROM schema_migrations").fetchall()
-        self.assertEqual([r[0] for r in rows], [1, 2])
+        self.assertEqual([r[0] for r in rows], [1, 2, 3])
 
     def test_scope_column_exists(self):
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(inventory)")}
@@ -39,6 +39,7 @@ class MigrationTests(DBTestCase):
         self.assertIn("inventory", names)
         self.assertIn("action_log", names)
         self.assertIn("users", names)
+        self.assertIn("saved_recipes", names)
 
 
 class InventoryWriteTests(DBTestCase):
@@ -194,6 +195,46 @@ class ActionLogTests(DBTestCase):
         rows = self.conn.execute("SELECT * FROM action_log").fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["raw_message"], "bought milk")
+
+
+class SavedRecipeTests(DBTestCase):
+    def test_add_list_and_dedupe_url(self):
+        r1, created = db.add_saved_recipe(
+            self.conn,
+            "user:u1",
+            "u1",
+            "https://www.instagram.com/reel/abc",
+            "Reel A",
+            ["korean", "spicy"],
+        )
+        self.assertTrue(created)
+        r2, created2 = db.add_saved_recipe(
+            self.conn,
+            "user:u1",
+            "u1",
+            "https://www.instagram.com/reel/abc",
+            "Saved recipe",
+            ["weeknight"],
+        )
+        self.assertFalse(created2)
+        self.assertEqual(r2.id, r1.id)
+        self.assertEqual(r2.keywords, ["korean", "spicy", "weeknight"])
+        self.assertEqual(r2.title, "Reel A")  # kept prior title
+        listed = db.list_saved_recipes(self.conn, "user:u1")
+        self.assertEqual(len(listed), 1)
+
+    def test_delete(self):
+        r, _ = db.add_saved_recipe(
+            self.conn,
+            "chat:9",
+            "alice",
+            "https://www.instagram.com/reel/xyz",
+            "X",
+            ["easy"],
+        )
+        self.assertTrue(db.delete_saved_recipe(self.conn, "chat:9", r.id))
+        self.assertFalse(db.delete_saved_recipe(self.conn, "chat:9", r.id))
+        self.assertEqual(db.list_saved_recipes(self.conn, "chat:9"), [])
 
 
 if __name__ == "__main__":

@@ -284,23 +284,32 @@ def format_recipe_reply(
     ingredients: list[str],
     *,
     request: str = "",
+    saved_section: str = "",
 ) -> str:
-    """Plain-language Telegram reply with links."""
+    """Plain-language Telegram reply with links.
+
+    ``saved_section`` is an optional pre-formatted block for matched Instagram
+    saves (shown above LLM ideas).
+    """
     request = (request or "").strip()
-    if not ingredients and not request:
+    saved_section = (saved_section or "").strip()
+    if not ingredients and not request and not saved_section:
         return (
             "I don't have any ingredients to work with. "
-            "Add food to the fridge, or try: /recipe eggs milk spinach"
+            "Add food to the fridge, or try: /recipe eggs milk spinach\n"
+            "You can also save Instagram reels with /recipe_add."
         )
-    if not recipes:
+    if not recipes and not saved_section:
         if request and not ingredients:
             return (
                 f'I couldn\'t come up with ideas for "{request}". '
-                "Try a different style, or add items to the fridge first."
+                "Try a different keyword, add matching saves with /recipe_add, "
+                "or stock the fridge first."
             )
         return (
             "I couldn't come up with recipes for those ingredients. "
-            "Try a different mix, or add more items to the fridge."
+            "Try a different mix, add more items to the fridge, "
+            "or save a reel with /recipe_add."
         )
     header_parts: list[str] = []
     if ingredients:
@@ -309,26 +318,35 @@ def format_recipe_reply(
             based += ", …"
         header_parts.append(based)
     if request:
-        header_parts.append(f"Style: {request}")
-    blocks = ["\n".join(header_parts), ""]
-    for i, r in enumerate(recipes, 1):
-        lines = [f"{i}. {r.title}"]
-        if r.summary:
-            lines.append(r.summary)
-        nutrition = _format_nutrition_line(r)
-        if nutrition:
-            lines.append(nutrition)
-        if r.uses:
-            lines.append("Uses: " + ", ".join(r.uses))
-        if r.missing:
-            lines.append("You might also need: " + ", ".join(r.missing))
-        lines.append(f"Recipe: {r.url}")
-        blocks.append("\n".join(lines))
+        header_parts.append(f"Looking for: {request}")
+    blocks: list[str] = []
+    if header_parts:
+        blocks.append("\n".join(header_parts))
         blocks.append("")
-    # Disclaimer once at the end — estimates, not lab values.
-    blocks.append(
-        "Calorie/macro figures are rough estimates, not exact nutrition facts."
-    )
+    if saved_section:
+        blocks.append(saved_section)
+        blocks.append("")
+    if recipes:
+        if saved_section:
+            blocks.append("More ideas:")
+            blocks.append("")
+        for i, r in enumerate(recipes, 1):
+            lines = [f"{i}. {r.title}"]
+            if r.summary:
+                lines.append(r.summary)
+            nutrition = _format_nutrition_line(r)
+            if nutrition:
+                lines.append(nutrition)
+            if r.uses:
+                lines.append("Uses: " + ", ".join(r.uses))
+            if r.missing:
+                lines.append("You might also need: " + ", ".join(r.missing))
+            lines.append(f"Recipe: {r.url}")
+            blocks.append("\n".join(lines))
+            blocks.append("")
+        blocks.append(
+            "Calorie/macro figures are rough estimates, not exact nutrition facts."
+        )
     return "\n".join(blocks).strip()
 
 

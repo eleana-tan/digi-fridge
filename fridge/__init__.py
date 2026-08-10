@@ -9,14 +9,16 @@ Package layout (kept intentionally boring and decoupled):
 - ``transcribe`` : voice audio -> text
 - ``vision``     : grocery/receipt photo -> proposed items
 - ``recipes``    : ingredients -> recipe ideas + clickable links
+- ``saved_recipes`` : Instagram reel URL/keyword helpers for saved inspiration
 - ``pending``    : draft edit/confirm helpers for photo proposals
 - ``actions``    : execute a parsed action against the DB, build a reply
 - ``reminders``  : find + notify about soon-to-expire items
 - ``bot``        : Telegram wiring / entrypoint (the only Telegram-aware module)
 - ``cli``        : offline pipeline tester
 
-The ``parser``, ``vision``, ``recipes``, and ``pending`` layers never import
-Telegram, so they can be unit-tested without a live bot connection.
+The ``parser``, ``vision``, ``recipes``, ``saved_recipes``, and ``pending``
+layers never import Telegram, so they can be unit-tested without a live bot
+connection.
 """
 
 __version__ = "0.1.0"

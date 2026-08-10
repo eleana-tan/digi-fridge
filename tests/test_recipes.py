@@ -168,6 +168,17 @@ class FormatReplyTests(unittest.TestCase):
         self.assertIn("garlic", text)
         self.assertIn("rough estimates", text)
 
+    def test_includes_saved_section(self):
+        text = format_recipe_reply(
+            [],
+            ["eggs"],
+            request="korean",
+            saved_section="From your saved Reels:\n\n1. Kimchi\nhttps://ig",
+        )
+        self.assertIn("Looking for: korean", text)
+        self.assertIn("From your saved Reels", text)
+        self.assertIn("Kimchi", text)
+
     def test_empty_ingredients_message(self):
         text = format_recipe_reply([], [])
         self.assertIn("/recipe", text)

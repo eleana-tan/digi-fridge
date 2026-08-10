@@ -67,3 +67,16 @@ class InventoryItem:
     updated_ts: str
     expires_on: Optional[str]
     category: Optional[str]
+
+
+@dataclass
+class SavedRecipe:
+    """A user-saved recipe link (e.g. Instagram Reel) with search keywords."""
+
+    id: int
+    scope_key: str
+    added_by: str
+    url: str
+    title: str
+    keywords: list[str]
+    created_ts: str
